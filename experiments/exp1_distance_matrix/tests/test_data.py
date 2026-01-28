@@ -116,15 +116,12 @@ class TestDistanceDataset:
         assert item["text"].startswith("<start>")
         assert item["text"].endswith("<end>")
 
-    def test_reproducibility_with_seed(self):
-        dataset1 = DistanceDataset(size=10, n_points=20, seed=42)
-        dataset2 = DistanceDataset(size=10, n_points=20, seed=42)
-
-        item1 = dataset1[5]
-        item2 = dataset2[5]
-
-        assert item1["text"] == item2["text"]
-        assert np.allclose(item1["coordinates"], item2["coordinates"])
+    def test_fresh_data_each_access(self):
+        dataset = DistanceDataset(size=10, n_points=20)
+        item1 = dataset[0]
+        item2 = dataset[0]
+        # Each access generates fresh data
+        assert item1["text"] != item2["text"]
 
 
 class TestEvalDataset:

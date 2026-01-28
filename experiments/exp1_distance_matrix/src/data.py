@@ -148,7 +148,7 @@ def split_document_for_eval(
 
 
 class DistanceDataset(Dataset):
-    """Dataset that generates distance documents on-the-fly."""
+    """Dataset that generates distance documents on-the-fly (no repeats)."""
 
     def __init__(
         self,
@@ -160,32 +160,22 @@ class DistanceDataset(Dataset):
         """Initialize dataset.
 
         Args:
-            size: Number of documents in dataset.
+            size: Number of documents per "epoch" (for __len__).
             n_points: Number of points per document.
             coord_range: Coordinates sampled uniformly from [-coord_range, coord_range].
-            seed: Random seed for reproducibility.
+            seed: Not used (kept for API compatibility).
         """
         self.size = size
         self.n_points = n_points
         self.coord_range = coord_range
-        self.seed = seed
-
-        # Pre-generate all documents for consistency
-        if seed is not None:
-            np.random.seed(seed)
-            random.seed(seed)
-
-        self.documents = []
-        for _ in range(size):
-            coords = generate_coordinates(n_points, coord_range)
-            doc = create_document(coords)
-            self.documents.append(doc)
 
     def __len__(self) -> int:
         return self.size
 
     def __getitem__(self, idx: int) -> dict:
-        doc = self.documents[idx]
+        # Generate fresh document each time (no caching)
+        coords = generate_coordinates(self.n_points, self.coord_range)
+        doc = create_document(coords)
         return {
             "text": doc.to_text(),
             "coordinates": doc.coordinates,
@@ -195,7 +185,7 @@ class DistanceDataset(Dataset):
 
 
 class EvalDataset(Dataset):
-    """Dataset for evaluation with observed/held-out splits."""
+    """Dataset for evaluation with observed/held-out splits (fresh each time)."""
 
     def __init__(
         self,
@@ -208,46 +198,32 @@ class EvalDataset(Dataset):
         """Initialize evaluation dataset.
 
         Args:
-            size: Number of evaluation examples.
+            size: Number of evaluation examples per "epoch" (for __len__).
             n_points: Number of points per document.
             coord_range: Coordinates sampled uniformly from [-coord_range, coord_range].
             n_observed: Number of observed pairs (rest are held out).
-            seed: Random seed for reproducibility.
+            seed: Not used (kept for API compatibility).
         """
         self.size = size
         self.n_points = n_points
         self.coord_range = coord_range
         self.n_observed = n_observed
 
-        if seed is not None:
-            np.random.seed(seed)
-            random.seed(seed)
-
-        self.examples = []
-        for _ in range(size):
-            coords = generate_coordinates(n_points, coord_range)
-            doc = create_document(coords)
-            observed, held_out = split_document_for_eval(doc, n_observed)
-            self.examples.append(
-                {
-                    "observed": observed,
-                    "held_out": held_out,
-                    "full": doc,
-                }
-            )
-
     def __len__(self) -> int:
         return self.size
 
     def __getitem__(self, idx: int) -> dict:
-        example = self.examples[idx]
+        # Generate fresh example each time (no caching)
+        coords = generate_coordinates(self.n_points, self.coord_range)
+        doc = create_document(coords)
+        observed, held_out = split_document_for_eval(doc, self.n_observed)
         return {
-            "prompt": example["observed"].to_text(include_end=False),
-            "observed_pairs": example["observed"].pairs,
-            "observed_distances": example["observed"].distances,
-            "held_out_pairs": example["held_out"].pairs,
-            "held_out_distances": example["held_out"].distances,
-            "coordinates": example["full"].coordinates,
+            "prompt": observed.to_text(include_end=False),
+            "observed_pairs": observed.pairs,
+            "observed_distances": observed.distances,
+            "held_out_pairs": held_out.pairs,
+            "held_out_distances": held_out.distances,
+            "coordinates": doc.coordinates,
         }
 
 

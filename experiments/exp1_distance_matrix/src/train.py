@@ -7,6 +7,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import wandb
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
@@ -100,6 +101,9 @@ def train(
     seed: int = 42,
     output_dir: str = "outputs",
     device: str | None = None,
+    use_wandb: bool = True,
+    wandb_project: str = "distance-matrix-completion",
+    wandb_run_name: str | None = None,
 ) -> dict:
     """Train the distance matrix completion model."""
     # Setup
@@ -113,6 +117,32 @@ def train(
 
     # Set random seed
     torch.manual_seed(seed)
+
+    # Config dict for logging
+    config = {
+        "n_points": n_points,
+        "mask_ratio": mask_ratio,
+        "d_model": d_model,
+        "n_heads": n_heads,
+        "n_layers": n_layers,
+        "d_ff": d_ff,
+        "dropout": dropout,
+        "batch_size": batch_size,
+        "lr": lr,
+        "n_epochs": n_epochs,
+        "train_samples": train_samples,
+        "val_samples": val_samples,
+        "test_samples": test_samples,
+        "seed": seed,
+    }
+
+    # Initialize wandb
+    if use_wandb:
+        wandb.init(
+            project=wandb_project,
+            name=wandb_run_name,
+            config=config,
+        )
 
     # Create dataloaders
     train_loader, val_loader, test_loader = create_dataloaders(
@@ -138,6 +168,9 @@ def train(
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params:,}")
 
+    if use_wandb:
+        wandb.config.update({"n_params": n_params})
+
     # Loss and optimizer
     loss_fn = DistanceMatrixLoss()
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.01)
@@ -150,6 +183,7 @@ def train(
     for epoch in range(n_epochs):
         train_loss = train_epoch(model, train_loader, optimizer, loss_fn, device)
         val_metrics = evaluate(model, val_loader, loss_fn, device)
+        current_lr = scheduler.get_last_lr()[0]
         scheduler.step()
 
         history["train_loss"].append(train_loss)
@@ -157,10 +191,24 @@ def train(
         history["val_mae"].append(val_metrics["mae"])
         history["val_rmse"].append(val_metrics["rmse"])
 
+        # Log to wandb
+        if use_wandb:
+            wandb.log({
+                "epoch": epoch + 1,
+                "train/loss": train_loss,
+                "val/loss": val_metrics["loss"],
+                "val/mae": val_metrics["mae"],
+                "val/rmse": val_metrics["rmse"],
+                "lr": current_lr,
+            })
+
         # Save best model
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
             torch.save(model.state_dict(), output_path / "best_model.pt")
+            if use_wandb:
+                wandb.run.summary["best_val_loss"] = best_val_loss
+                wandb.run.summary["best_epoch"] = epoch + 1
 
         if (epoch + 1) % 10 == 0 or epoch == 0:
             print(
@@ -179,25 +227,22 @@ def train(
         f"MAE: {test_metrics['mae']:.4f} | RMSE: {test_metrics['rmse']:.4f}"
     )
 
+    # Log test metrics to wandb
+    if use_wandb:
+        wandb.log({
+            "test/loss": test_metrics["loss"],
+            "test/mae": test_metrics["mae"],
+            "test/rmse": test_metrics["rmse"],
+        })
+        wandb.run.summary["test_loss"] = test_metrics["loss"]
+        wandb.run.summary["test_mae"] = test_metrics["mae"]
+        wandb.run.summary["test_rmse"] = test_metrics["rmse"]
+        wandb.finish()
+
     # Save results
+    config["n_params"] = n_params
     results = {
-        "config": {
-            "n_points": n_points,
-            "mask_ratio": mask_ratio,
-            "d_model": d_model,
-            "n_heads": n_heads,
-            "n_layers": n_layers,
-            "d_ff": d_ff,
-            "dropout": dropout,
-            "batch_size": batch_size,
-            "lr": lr,
-            "n_epochs": n_epochs,
-            "train_samples": train_samples,
-            "val_samples": val_samples,
-            "test_samples": test_samples,
-            "seed": seed,
-            "n_params": n_params,
-        },
+        "config": config,
         "test_metrics": test_metrics,
         "history": history,
     }
@@ -226,9 +271,32 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default="outputs/exp1")
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument("--wandb-project", type=str, default="distance-matrix-completion")
+    parser.add_argument("--wandb-run-name", type=str, default=None)
 
     args = parser.parse_args()
-    train(**vars(args))
+    train(
+        n_points=args.n_points,
+        mask_ratio=args.mask_ratio,
+        d_model=args.d_model,
+        n_heads=args.n_heads,
+        n_layers=args.n_layers,
+        d_ff=args.d_ff,
+        dropout=args.dropout,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        n_epochs=args.n_epochs,
+        train_samples=args.train_samples,
+        val_samples=args.val_samples,
+        test_samples=args.test_samples,
+        seed=args.seed,
+        output_dir=args.output_dir,
+        device=args.device,
+        use_wandb=not args.no_wandb,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
+    )
 
 
 if __name__ == "__main__":

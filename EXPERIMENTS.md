@@ -19,14 +19,16 @@ This document describes the derisking experiments for the LLM-based protein stru
 uv run python -m experiments.exp1_distance_matrix.src.train \
     --n-epochs 20 \
     --train-samples 2000 \
+    --no-wandb \
     --output-dir outputs/exp1_quick
 
-# Full training run
+# Full training run with wandb logging
 uv run python -m experiments.exp1_distance_matrix.src.train \
-    --n-epochs 100 \
-    --train-samples 10000 \
-    --d-model 256 \
-    --n-layers 6 \
+    --n-epochs 1000 \
+    --train-samples 100000 \
+    --batch-size 128 \
+    --lr 3e-4 \
+    --wandb-project distance-matrix-completion \
     --output-dir outputs/exp1_full
 ```
 
@@ -253,19 +255,30 @@ def procrustes_align(
     return aligned, rmsd.mean().item()
 ```
 
-### Preliminary Results
+### Results
 
-Quick training run (20 epochs, 2000 samples, smaller model):
+**Full training run** (1000 epochs, 100k samples, 4.9M parameters):
 
-| Metric | Epoch 1 | Epoch 20 |
-|--------|---------|----------|
-| Train Loss | 514.64 | 89.44 |
-| Val Loss | 462.27 | 90.48 |
-| Val MAE | 19.15 | 7.50 |
-| Val RMSE | 21.50 | 9.51 |
-| **Test MAE** | - | **7.36** |
+| Metric | Value |
+|--------|-------|
+| **Test Loss (MSE)** | 0.0653 |
+| **Test MAE** | 0.171 |
+| **Test RMSE** | 0.256 |
+| Best Epoch | 779 |
+| Best Val Loss | 0.0621 |
 
-The model shows clear learning, with MAE dropping from ~19 to ~7.4. With more training, larger models, and more data, this should approach near-zero as specified in the success criteria.
+Given coordinates scaled to ~10 units (distances ranging 0-30+), a **MAE of 0.17** is effectively **near-zero**, meeting the success criteria.
+
+**wandb run:** https://wandb.ai/timodonnell/distance-matrix-completion/runs/mbk250c5
+
+Training progression:
+
+| Epoch | Train Loss | Val MAE |
+|-------|------------|---------|
+| 1 | 98.68 | 19.15 |
+| 100 | 1.75 | 0.92 |
+| 500 | 0.21 | 0.21 |
+| 1000 | 0.13 | 0.18 |
 
 ### Configuration Options
 

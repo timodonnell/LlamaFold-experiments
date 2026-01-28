@@ -15,11 +15,11 @@ from experiments.exp1_distance_matrix.src.data import (
 
 class TestGenerateCoordinates:
     def test_shape(self):
-        coords = generate_coordinates(n_points=20, std=100.0)
+        coords = generate_coordinates(n_points=20, coord_range=100.0)
         assert coords.shape == (20, 3)
 
     def test_different_n_points(self):
-        coords = generate_coordinates(n_points=10, std=50.0)
+        coords = generate_coordinates(n_points=10, coord_range=50.0)
         assert coords.shape == (10, 3)
 
 

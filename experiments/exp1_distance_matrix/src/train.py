@@ -497,7 +497,7 @@ def train(
     val_samples: int = 500,
     eval_samples: int = 100,
     n_points: int = 20,
-    coord_std: float = 100.0,
+    coord_range: float = 100.0,
     n_observed: int = 180,
     batch_size: int = 4,
     gradient_accumulation_steps: int = 8,
@@ -518,7 +518,7 @@ def train(
         val_samples: Number of validation documents.
         eval_samples: Number of evaluation examples.
         n_points: Number of points per document.
-        coord_std: Standard deviation of point coordinates.
+        coord_range: Coordinates sampled uniformly from [-coord_range, coord_range].
         n_observed: Number of observed pairs in eval (rest are held out).
         batch_size: Training batch size per device.
         gradient_accumulation_steps: Gradient accumulation steps.
@@ -548,7 +548,7 @@ def train(
         "val_samples": val_samples,
         "eval_samples": eval_samples,
         "n_points": n_points,
-        "coord_std": coord_std,
+        "coord_range": coord_range,
         "n_observed": n_observed,
         "batch_size": batch_size,
         "gradient_accumulation_steps": gradient_accumulation_steps,
@@ -597,19 +597,19 @@ def train(
     train_dataset = DistanceDataset(
         size=train_samples,
         n_points=n_points,
-        std=coord_std,
+        coord_range=coord_range,
         seed=seed,
     )
     val_dataset = DistanceDataset(
         size=val_samples,
         n_points=n_points,
-        std=coord_std,
+        coord_range=coord_range,
         seed=seed + 100000,
     )
     eval_dataset = EvalDataset(
         size=eval_samples,
         n_points=n_points,
-        std=coord_std,
+        coord_range=coord_range,
         n_observed=n_observed,
         seed=seed + 200000,
     )
@@ -830,7 +830,7 @@ def main():
         val_samples=args.val_samples,
         eval_samples=args.eval_samples,
         n_points=args.n_points,
-        coord_std=args.coord_std,
+        coord_range=args.coord_range,
         n_observed=args.n_observed,
         batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,

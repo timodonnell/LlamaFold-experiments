@@ -28,17 +28,17 @@ class DistanceDocument:
         return "\n".join(lines)
 
 
-def generate_coordinates(n_points: int = 20, std: float = 100.0) -> np.ndarray:
-    """Generate random 3D coordinates.
+def generate_coordinates(n_points: int = 20, coord_range: float = 100.0) -> np.ndarray:
+    """Generate random 3D coordinates from uniform distribution.
 
     Args:
         n_points: Number of points to generate.
-        std: Standard deviation of coordinates.
+        coord_range: Coordinates are sampled uniformly from [-coord_range, coord_range].
 
     Returns:
         Array of shape (n_points, 3) with coordinates.
     """
-    return np.random.randn(n_points, 3) * std
+    return np.random.uniform(-coord_range, coord_range, size=(n_points, 3))
 
 
 def compute_all_distances(coords: np.ndarray) -> dict[tuple[int, int], int]:
@@ -148,7 +148,7 @@ class DistanceDataset(Dataset):
         self,
         size: int,
         n_points: int = 20,
-        std: float = 100.0,
+        coord_range: float = 100.0,
         seed: int | None = None,
     ):
         """Initialize dataset.
@@ -156,12 +156,12 @@ class DistanceDataset(Dataset):
         Args:
             size: Number of documents in dataset.
             n_points: Number of points per document.
-            std: Standard deviation of point coordinates.
+            coord_range: Coordinates sampled uniformly from [-coord_range, coord_range].
             seed: Random seed for reproducibility.
         """
         self.size = size
         self.n_points = n_points
-        self.std = std
+        self.coord_range = coord_range
         self.seed = seed
 
         # Pre-generate all documents for consistency
@@ -171,7 +171,7 @@ class DistanceDataset(Dataset):
 
         self.documents = []
         for _ in range(size):
-            coords = generate_coordinates(n_points, std)
+            coords = generate_coordinates(n_points, coord_range)
             doc = create_document(coords)
             self.documents.append(doc)
 
@@ -195,7 +195,7 @@ class EvalDataset(Dataset):
         self,
         size: int,
         n_points: int = 20,
-        std: float = 100.0,
+        coord_range: float = 100.0,
         n_observed: int = 180,
         seed: int | None = None,
     ):
@@ -204,13 +204,13 @@ class EvalDataset(Dataset):
         Args:
             size: Number of evaluation examples.
             n_points: Number of points per document.
-            std: Standard deviation of point coordinates.
+            coord_range: Coordinates sampled uniformly from [-coord_range, coord_range].
             n_observed: Number of observed pairs (rest are held out).
             seed: Random seed for reproducibility.
         """
         self.size = size
         self.n_points = n_points
-        self.std = std
+        self.coord_range = coord_range
         self.n_observed = n_observed
 
         if seed is not None:
@@ -219,7 +219,7 @@ class EvalDataset(Dataset):
 
         self.examples = []
         for _ in range(size):
-            coords = generate_coordinates(n_points, std)
+            coords = generate_coordinates(n_points, coord_range)
             doc = create_document(coords)
             observed, held_out = split_document_for_eval(doc, n_observed)
             self.examples.append(

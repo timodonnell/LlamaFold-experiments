@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -669,6 +670,25 @@ def train(
             name=wandb_run_name,
             config=config,
         )
+
+        # Log training command
+        command = " ".join(sys.argv)
+        wandb.config.update({"command": command})
+
+        # Log model summary
+        model_summary = {
+            "total_parameters": n_params,
+            "trainable_parameters": n_trainable,
+            "vocabulary_size": len(tokenizer),
+            "hidden_size": model_config.hidden_size,
+            "intermediate_size": model_config.intermediate_size,
+            "num_layers": model_config.num_hidden_layers,
+            "num_attention_heads": model_config.num_attention_heads,
+            "num_kv_heads": model_config.num_key_value_heads,
+            "max_sequence_length": model_config.max_position_embeddings,
+            "device": str(device),
+        }
+        wandb.config.update({"model_summary": model_summary})
 
     # Create example logging callback
     example_callback = ExampleLoggingCallback(

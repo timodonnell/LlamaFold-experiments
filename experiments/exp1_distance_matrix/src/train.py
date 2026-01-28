@@ -809,7 +809,7 @@ def main():
     parser.add_argument("--val-samples", type=int, default=500)
     parser.add_argument("--eval-samples", type=int, default=100)
     parser.add_argument("--n-points", type=int, default=20)
-    parser.add_argument("--coord-std", type=float, default=100.0)
+    parser.add_argument("--coord-range", type=float, default=100.0)
     parser.add_argument("--n-observed", type=int, default=180)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)

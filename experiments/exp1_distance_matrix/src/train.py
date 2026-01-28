@@ -483,6 +483,7 @@ class ExampleLoggingCallback(TrainerCallback):
             example_table = wandb.Table(
                 columns=[
                     "step",
+                    "prompt",
                     "prompt_tokens",
                     "new_text",
                     "held_out_pairs",
@@ -502,6 +503,7 @@ class ExampleLoggingCallback(TrainerCallback):
                 }
                 example_table.add_data(
                     state.global_step,
+                    ex["prompt"],
                     ex.get("prompt_tokens", 0),
                     ex.get("new_text", ""),
                     str(ex["held_out_pairs"]),
@@ -801,6 +803,7 @@ def train(
         # Log examples as a table
         example_table = wandb.Table(
             columns=[
+                "prompt",
                 "prompt_tokens",
                 "new_text",
                 "held_out_pairs",
@@ -812,6 +815,7 @@ def train(
         )
         for example in eval_results["logged_examples"]:
             example_table.add_data(
+                example["prompt"],
                 example.get("prompt_tokens", 0),
                 example.get("new_text", ""),
                 str(example["held_out_pairs"]),

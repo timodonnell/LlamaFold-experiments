@@ -1,6 +1,6 @@
 """Training script for distance matrix LLM experiment.
 
-Fine-tunes Llama 3.2 1B on distance document pretraining data.
+Trains a small transformer from scratch on distance document data.
 """
 
 from __future__ import annotations
@@ -14,10 +14,14 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 from scipy import stats
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import WhitespaceSplit
 from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
     DataCollatorForLanguageModeling,
+    LlamaConfig,
+    LlamaForCausalLM,
+    PreTrainedTokenizerFast,
     Trainer,
     TrainerCallback,
     TrainingArguments,
@@ -31,31 +35,64 @@ if TYPE_CHECKING:
     from transformers import PreTrainedModel, PreTrainedTokenizer
 
 
-def setup_tokenizer(model_name: str) -> PreTrainedTokenizer:
-    """Set up tokenizer with special tokens for distance task."""
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-    # Set pad token if not set
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    # Add special tokens
+def create_tokenizer() -> PreTrainedTokenizerFast:
+    """Create a tokenizer from scratch with only our custom tokens."""
+    # Get all special tokens
     special_tokens = get_special_tokens()
-    tokenizer.add_tokens(special_tokens)
 
-    return tokenizer  # type: ignore[return-value]
+    # Add newline token and pad/eos tokens
+    all_tokens = ["<pad>", "<eos>", "\n"] + special_tokens
 
+    # Create vocabulary mapping
+    vocab = {token: idx for idx, token in enumerate(all_tokens)}
 
-def setup_model(model_name: str, tokenizer: PreTrainedTokenizer) -> PreTrainedModel:
-    """Set up model with resized embeddings for special tokens."""
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
+    # Create a WordLevel tokenizer
+    tokenizer_model = WordLevel(vocab=vocab, unk_token="<pad>")
+    tokenizer = Tokenizer(tokenizer_model)
+
+    # Use whitespace + newline splitting as pre-tokenizer
+    tokenizer.pre_tokenizer = WhitespaceSplit()
+
+    # Wrap in HuggingFace PreTrainedTokenizerFast
+    hf_tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer,
+        unk_token="<pad>",
+        pad_token="<pad>",
+        eos_token="<eos>",
+        bos_token="<start>",
     )
 
-    # Resize embeddings for new tokens
-    model.resize_token_embeddings(len(tokenizer))
+    return hf_tokenizer
+
+
+def create_model(vocab_size: int, **kwargs) -> LlamaForCausalLM:
+    """Create a small Llama model from scratch (randomly initialized).
+
+    Args:
+        vocab_size: Size of the vocabulary.
+        **kwargs: Override default config values.
+
+    Returns:
+        Randomly initialized LlamaForCausalLM.
+    """
+    # Small model config - roughly 50M parameters
+    config = LlamaConfig(
+        vocab_size=vocab_size,
+        hidden_size=kwargs.get("hidden_size", 512),
+        intermediate_size=kwargs.get("intermediate_size", 1024),
+        num_hidden_layers=kwargs.get("num_layers", 8),
+        num_attention_heads=kwargs.get("num_heads", 8),
+        num_key_value_heads=kwargs.get("num_kv_heads", 4),
+        max_position_embeddings=kwargs.get("max_seq_len", 2048),
+        rms_norm_eps=1e-5,
+        tie_word_embeddings=False,
+        pad_token_id=0,
+        eos_token_id=1,
+        bos_token_id=2,  # <start> token
+    )
+
+    # Initialize model with random weights
+    model = LlamaForCausalLM(config)
 
     return model
 
@@ -444,8 +481,8 @@ class ExampleLoggingCallback(TrainerCallback):
                 }
                 example_table.add_data(
                     state.global_step,
-                    ex["prompt"][:500] + "...",  # Truncate for readability
-                    ex["generated"][-500:],  # Show end of generation
+                    ex["prompt"],
+                    ex["generated"],
                     str(ex["held_out_pairs"]),
                     str(ex["held_out_distances"]),
                     str(matched),
@@ -456,7 +493,6 @@ class ExampleLoggingCallback(TrainerCallback):
 
 
 def train(
-    model_name: str = "meta-llama/Llama-3.2-1B",
     train_samples: int = 10000,
     val_samples: int = 500,
     eval_samples: int = 100,
@@ -475,10 +511,9 @@ def train(
     wandb_run_name: str | None = None,
     log_examples: int = 5,
 ) -> dict[str, Any]:
-    """Train the distance prediction LLM.
+    """Train the distance prediction LLM from scratch.
 
     Args:
-        model_name: HuggingFace model name.
         train_samples: Number of training documents.
         val_samples: Number of validation documents.
         eval_samples: Number of evaluation examples.
@@ -509,7 +544,6 @@ def train(
 
     # Config for logging
     config = {
-        "model_name": model_name,
         "train_samples": train_samples,
         "val_samples": val_samples,
         "eval_samples": eval_samples,
@@ -525,11 +559,39 @@ def train(
     }
 
     print("Setting up tokenizer and model...")
-    tokenizer = setup_tokenizer(model_name)
-    model = setup_model(model_name, tokenizer)
+    tokenizer = create_tokenizer()
+    model = create_model(vocab_size=len(tokenizer))
 
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"Vocabulary size: {len(tokenizer)}")
+    # Move model to GPU if available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+
+    # Log model summary
+    n_params = sum(p.numel() for p in model.parameters())
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    model_config = model.config
+
+    print("\n" + "=" * 60)
+    print("MODEL SUMMARY")
+    print("=" * 60)
+    print(f"  Total parameters:     {n_params:,}")
+    print(f"  Trainable parameters: {n_trainable:,}")
+    print(f"  Vocabulary size:      {len(tokenizer)}")
+    print(f"  Hidden size:          {model_config.hidden_size}")
+    print(f"  Intermediate size:    {model_config.intermediate_size}")
+    print(f"  Num layers:           {model_config.num_hidden_layers}")
+    print(f"  Num attention heads:  {model_config.num_attention_heads}")
+    print(f"  Num KV heads:         {model_config.num_key_value_heads}")
+    print(f"  Max sequence length:  {model_config.max_position_embeddings}")
+    print(f"  Device:               {device}")
+    print("=" * 60 + "\n")
+
+    # Add model info to config for wandb
+    config["n_params"] = n_params
+    config["hidden_size"] = model_config.hidden_size
+    config["num_layers"] = model_config.num_hidden_layers
+    config["num_heads"] = model_config.num_attention_heads
+    config["vocab_size"] = len(tokenizer)
 
     print("Creating datasets...")
     train_dataset = DistanceDataset(
@@ -742,10 +804,7 @@ def train(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train distance prediction LLM")
-    parser.add_argument(
-        "--model-name", type=str, default="meta-llama/Llama-3.2-1B", help="HuggingFace model name"
-    )
+    parser = argparse.ArgumentParser(description="Train distance prediction LLM from scratch")
     parser.add_argument("--train-samples", type=int, default=10000)
     parser.add_argument("--val-samples", type=int, default=500)
     parser.add_argument("--eval-samples", type=int, default=100)
@@ -767,7 +826,6 @@ def main():
     args = parser.parse_args()
 
     train(
-        model_name=args.model_name,
         train_samples=args.train_samples,
         val_samples=args.val_samples,
         eval_samples=args.eval_samples,

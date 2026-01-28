@@ -1,133 +1,258 @@
-"""Data generation for distance matrix completion experiment.
+"""Data generation for distance matrix experiment.
 
-Generates random 3D point clouds and their distance matrices with masking
-for training the model to predict missing distances.
+Generates documents showing pairwise distances between random 3D points
+in a text format suitable for LLM training.
 """
 
-from typing import NamedTuple
+import random
+from dataclasses import dataclass
 
-import torch
-from torch.utils.data import DataLoader, Dataset
-
-
-class DistanceMatrixBatch(NamedTuple):
-    """Batch of distance matrix completion examples."""
-
-    distances: torch.Tensor  # (batch, n_points, n_points) full distance matrices
-    mask: torch.Tensor  # (batch, n_points, n_points) 1 = observed, 0 = to predict
-    points: torch.Tensor  # (batch, n_points, 3) original coordinates (for evaluation)
+import numpy as np
+from torch.utils.data import Dataset
 
 
-class DistanceMatrixDataset(Dataset):
-    """Dataset that generates random 3D point clouds and distance matrices on-the-fly."""
+@dataclass
+class DistanceDocument:
+    """A document containing pairwise distances."""
+
+    coordinates: np.ndarray  # (20, 3) coordinates
+    pairs: list[tuple[int, int]]  # List of (point_i, point_j) pairs
+    distances: list[int]  # Corresponding integer distances
+
+    def to_text(self) -> str:
+        """Convert to text format for LLM training."""
+        lines = ["<start>"]
+        for (i, j), dist in zip(self.pairs, self.distances):
+            lines.append(f"<point {i}><point {j}><{dist}>")
+        lines.append("<end>")
+        return "\n".join(lines)
+
+
+def generate_coordinates(n_points: int = 20, std: float = 100.0) -> np.ndarray:
+    """Generate random 3D coordinates.
+
+    Args:
+        n_points: Number of points to generate.
+        std: Standard deviation of coordinates.
+
+    Returns:
+        Array of shape (n_points, 3) with coordinates.
+    """
+    return np.random.randn(n_points, 3) * std
+
+
+def compute_all_distances(coords: np.ndarray) -> dict[tuple[int, int], int]:
+    """Compute all pairwise distances between points.
+
+    Args:
+        coords: Array of shape (n_points, 3).
+
+    Returns:
+        Dictionary mapping (i, j) pairs (i < j) to integer distances.
+    """
+    n_points = len(coords)
+    distances = {}
+    for i in range(n_points):
+        for j in range(i + 1, n_points):
+            dist = np.linalg.norm(coords[i] - coords[j])
+            distances[(i, j)] = int(round(dist))
+    return distances
+
+
+def create_document(
+    coords: np.ndarray,
+    pair_order: list[tuple[int, int]] | None = None,
+    swap_prob: float = 0.5,
+) -> DistanceDocument:
+    """Create a distance document from coordinates.
+
+    Args:
+        coords: Array of shape (n_points, 3).
+        pair_order: Optional specific ordering of pairs. If None, random order is used.
+        swap_prob: Probability of swapping (i,j) to (j,i) for each pair.
+
+    Returns:
+        DistanceDocument with randomized pair ordering.
+    """
+    distances = compute_all_distances(coords)
+    all_pairs = list(distances.keys())
+
+    if pair_order is None:
+        pair_order = all_pairs.copy()
+        random.shuffle(pair_order)
+
+    # Randomly swap order within pairs
+    final_pairs = []
+    final_distances = []
+    for i, j in pair_order:
+        if random.random() < swap_prob:
+            final_pairs.append((j, i))
+        else:
+            final_pairs.append((i, j))
+        # Distance is symmetric, so use the canonical (min, max) key
+        key = (min(i, j), max(i, j))
+        final_distances.append(distances[key])
+
+    return DistanceDocument(
+        coordinates=coords,
+        pairs=final_pairs,
+        distances=final_distances,
+    )
+
+
+def split_document_for_eval(
+    doc: DistanceDocument,
+    n_observed: int = 180,
+) -> tuple[DistanceDocument, DistanceDocument]:
+    """Split a document into observed and held-out portions.
+
+    Args:
+        doc: Full distance document.
+        n_observed: Number of pairs to include in observed portion.
+
+    Returns:
+        Tuple of (observed_doc, held_out_doc).
+    """
+    n_total = len(doc.pairs)
+    indices = list(range(n_total))
+    random.shuffle(indices)
+
+    observed_indices = indices[:n_observed]
+    held_out_indices = indices[n_observed:]
+
+    observed_pairs = [doc.pairs[i] for i in observed_indices]
+    observed_distances = [doc.distances[i] for i in observed_indices]
+
+    held_out_pairs = [doc.pairs[i] for i in held_out_indices]
+    held_out_distances = [doc.distances[i] for i in held_out_indices]
+
+    observed_doc = DistanceDocument(
+        coordinates=doc.coordinates,
+        pairs=observed_pairs,
+        distances=observed_distances,
+    )
+
+    held_out_doc = DistanceDocument(
+        coordinates=doc.coordinates,
+        pairs=held_out_pairs,
+        distances=held_out_distances,
+    )
+
+    return observed_doc, held_out_doc
+
+
+class DistanceDataset(Dataset):
+    """Dataset that generates distance documents on-the-fly."""
 
     def __init__(
         self,
-        n_samples: int,
+        size: int,
         n_points: int = 20,
-        mask_ratio: float = 0.3,
-        coord_scale: float = 10.0,
+        std: float = 100.0,
         seed: int | None = None,
     ):
-        """
+        """Initialize dataset.
+
         Args:
-            n_samples: Number of samples in the dataset
-            n_points: Number of points per point cloud
-            mask_ratio: Fraction of distances to mask (predict)
-            coord_scale: Scale of random coordinates
-            seed: Random seed for reproducibility
+            size: Number of documents in dataset.
+            n_points: Number of points per document.
+            std: Standard deviation of point coordinates.
+            seed: Random seed for reproducibility.
         """
-        self.n_samples = n_samples
+        self.size = size
         self.n_points = n_points
-        self.mask_ratio = mask_ratio
-        self.coord_scale = coord_scale
+        self.std = std
         self.seed = seed
 
+        # Pre-generate all documents for consistency
         if seed is not None:
-            self.rng = torch.Generator().manual_seed(seed)
-        else:
-            self.rng = torch.Generator()
+            np.random.seed(seed)
+            random.seed(seed)
+
+        self.documents = []
+        for _ in range(size):
+            coords = generate_coordinates(n_points, std)
+            doc = create_document(coords)
+            self.documents.append(doc)
 
     def __len__(self) -> int:
-        return self.n_samples
+        return self.size
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Generate random 3D points
-        if self.seed is not None:
-            # Deterministic based on idx and seed
-            rng = torch.Generator().manual_seed(self.seed + idx)
-        else:
-            rng = self.rng
-
-        points = torch.randn(self.n_points, 3, generator=rng) * self.coord_scale
-
-        # Compute pairwise distances
-        distances = torch.cdist(points, points)
-
-        # Create mask (1 = observed, 0 = to predict)
-        # Only mask upper triangle (distance matrix is symmetric)
-        n_pairs = self.n_points * (self.n_points - 1) // 2
-        n_mask = int(n_pairs * self.mask_ratio)
-
-        # Get upper triangle indices
-        triu_i, triu_j = torch.triu_indices(self.n_points, self.n_points, offset=1)
-        perm = torch.randperm(n_pairs, generator=rng)
-        mask_indices = perm[:n_mask]
-
-        mask = torch.ones(self.n_points, self.n_points)
-        mask[triu_i[mask_indices], triu_j[mask_indices]] = 0
-        mask[triu_j[mask_indices], triu_i[mask_indices]] = 0  # Symmetric
-
-        return distances, mask, points
+    def __getitem__(self, idx: int) -> dict:
+        doc = self.documents[idx]
+        return {
+            "text": doc.to_text(),
+            "coordinates": doc.coordinates,
+            "pairs": doc.pairs,
+            "distances": doc.distances,
+        }
 
 
-def create_dataloaders(
-    train_samples: int = 10000,
-    val_samples: int = 1000,
-    test_samples: int = 1000,
-    n_points: int = 20,
-    mask_ratio: float = 0.3,
-    batch_size: int = 64,
-    num_workers: int = 0,
-    seed: int = 42,
-) -> tuple[DataLoader, DataLoader, DataLoader]:
-    """Create train, validation, and test dataloaders."""
-    train_dataset = DistanceMatrixDataset(
-        n_samples=train_samples,
-        n_points=n_points,
-        mask_ratio=mask_ratio,
-        seed=seed,
-    )
-    val_dataset = DistanceMatrixDataset(
-        n_samples=val_samples,
-        n_points=n_points,
-        mask_ratio=mask_ratio,
-        seed=seed + 100000,
-    )
-    test_dataset = DistanceMatrixDataset(
-        n_samples=test_samples,
-        n_points=n_points,
-        mask_ratio=mask_ratio,
-        seed=seed + 200000,
-    )
+class EvalDataset(Dataset):
+    """Dataset for evaluation with observed/held-out splits."""
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-    )
+    def __init__(
+        self,
+        size: int,
+        n_points: int = 20,
+        std: float = 100.0,
+        n_observed: int = 180,
+        seed: int | None = None,
+    ):
+        """Initialize evaluation dataset.
 
-    return train_loader, val_loader, test_loader
+        Args:
+            size: Number of evaluation examples.
+            n_points: Number of points per document.
+            std: Standard deviation of point coordinates.
+            n_observed: Number of observed pairs (rest are held out).
+            seed: Random seed for reproducibility.
+        """
+        self.size = size
+        self.n_points = n_points
+        self.std = std
+        self.n_observed = n_observed
+
+        if seed is not None:
+            np.random.seed(seed)
+            random.seed(seed)
+
+        self.examples = []
+        for _ in range(size):
+            coords = generate_coordinates(n_points, std)
+            doc = create_document(coords)
+            observed, held_out = split_document_for_eval(doc, n_observed)
+            self.examples.append(
+                {
+                    "observed": observed,
+                    "held_out": held_out,
+                    "full": doc,
+                }
+            )
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __getitem__(self, idx: int) -> dict:
+        example = self.examples[idx]
+        return {
+            "prompt": example["observed"].to_text(),
+            "observed_pairs": example["observed"].pairs,
+            "observed_distances": example["observed"].distances,
+            "held_out_pairs": example["held_out"].pairs,
+            "held_out_distances": example["held_out"].distances,
+            "coordinates": example["full"].coordinates,
+        }
+
+
+def get_special_tokens() -> list[str]:
+    """Get list of special tokens needed for this task."""
+    tokens = ["<start>", "<end>"]
+    # Point tokens for 20 points
+    for i in range(20):
+        tokens.append(f"<point {i}>")
+    # Distance tokens - max distance with stdev=100 in 3D is roughly 600-800
+    # Use range 0-1000 to be safe
+    for d in range(1001):
+        tokens.append(f"<{d}>")
+    return tokens

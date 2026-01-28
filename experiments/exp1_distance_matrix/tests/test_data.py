@@ -1,105 +1,176 @@
 """Tests for data generation."""
 
-import torch
+import numpy as np
 
 from experiments.exp1_distance_matrix.src.data import (
-    DistanceMatrixDataset,
-    create_dataloaders,
+    DistanceDataset,
+    EvalDataset,
+    compute_all_distances,
+    create_document,
+    generate_coordinates,
+    get_special_tokens,
+    split_document_for_eval,
 )
 
 
-class TestDistanceMatrixDataset:
+class TestGenerateCoordinates:
+    def test_shape(self):
+        coords = generate_coordinates(n_points=20, std=100.0)
+        assert coords.shape == (20, 3)
+
+    def test_different_n_points(self):
+        coords = generate_coordinates(n_points=10, std=50.0)
+        assert coords.shape == (10, 3)
+
+
+class TestComputeAllDistances:
+    def test_number_of_pairs(self):
+        coords = generate_coordinates(n_points=20)
+        distances = compute_all_distances(coords)
+        # n*(n-1)/2 pairs for n=20
+        assert len(distances) == 20 * 19 // 2
+
+    def test_distances_are_positive(self):
+        coords = generate_coordinates(n_points=10)
+        distances = compute_all_distances(coords)
+        for dist in distances.values():
+            assert dist >= 0
+
+    def test_distances_are_integers(self):
+        coords = generate_coordinates(n_points=10)
+        distances = compute_all_distances(coords)
+        for dist in distances.values():
+            assert isinstance(dist, int)
+
+
+class TestCreateDocument:
+    def test_document_has_all_pairs(self):
+        coords = generate_coordinates(n_points=20)
+        doc = create_document(coords)
+        assert len(doc.pairs) == 20 * 19 // 2
+        assert len(doc.distances) == 20 * 19 // 2
+
+    def test_document_to_text_format(self):
+        coords = generate_coordinates(n_points=5)
+        doc = create_document(coords)
+        text = doc.to_text()
+
+        assert text.startswith("<start>")
+        assert text.endswith("<end>")
+        assert "<point" in text
+
+    def test_pairs_cover_all_combinations(self):
+        coords = generate_coordinates(n_points=5)
+        doc = create_document(coords)
+
+        # Get canonical pairs (smaller index first)
+        canonical_pairs = set()
+        for i, j in doc.pairs:
+            canonical_pairs.add((min(i, j), max(i, j)))
+
+        # Should have all 5*4/2 = 10 unique pairs
+        assert len(canonical_pairs) == 10
+
+
+class TestSplitDocumentForEval:
+    def test_split_sizes(self):
+        coords = generate_coordinates(n_points=20)
+        doc = create_document(coords)
+        observed, held_out = split_document_for_eval(doc, n_observed=180)
+
+        assert len(observed.pairs) == 180
+        assert len(held_out.pairs) == 10
+
+    def test_split_covers_all_pairs(self):
+        coords = generate_coordinates(n_points=20)
+        doc = create_document(coords)
+        observed, held_out = split_document_for_eval(doc, n_observed=180)
+
+        all_pairs = set()
+        for i, j in observed.pairs:
+            all_pairs.add((min(i, j), max(i, j)))
+        for i, j in held_out.pairs:
+            all_pairs.add((min(i, j), max(i, j)))
+
+        assert len(all_pairs) == 190
+
+
+class TestDistanceDataset:
     def test_dataset_length(self):
-        dataset = DistanceMatrixDataset(n_samples=100, n_points=10, seed=42)
+        dataset = DistanceDataset(size=100, n_points=20, seed=42)
         assert len(dataset) == 100
 
-    def test_dataset_shapes(self):
-        n_points = 15
-        dataset = DistanceMatrixDataset(n_samples=10, n_points=n_points, seed=42)
-        distances, mask, points = dataset[0]
+    def test_dataset_item_keys(self):
+        dataset = DistanceDataset(size=10, n_points=20, seed=42)
+        item = dataset[0]
 
-        assert distances.shape == (n_points, n_points)
-        assert mask.shape == (n_points, n_points)
-        assert points.shape == (n_points, 3)
+        assert "text" in item
+        assert "coordinates" in item
+        assert "pairs" in item
+        assert "distances" in item
 
-    def test_distance_matrix_symmetric(self):
-        dataset = DistanceMatrixDataset(n_samples=10, n_points=20, seed=42)
-        distances, _, _ = dataset[0]
+    def test_text_format(self):
+        dataset = DistanceDataset(size=10, n_points=20, seed=42)
+        item = dataset[0]
 
-        assert torch.allclose(distances, distances.T)
-
-    def test_distance_matrix_diagonal_zero(self):
-        dataset = DistanceMatrixDataset(n_samples=10, n_points=20, seed=42)
-        distances, _, _ = dataset[0]
-
-        assert torch.allclose(distances.diag(), torch.zeros(20))
-
-    def test_mask_symmetric(self):
-        dataset = DistanceMatrixDataset(n_samples=10, n_points=20, seed=42)
-        _, mask, _ = dataset[0]
-
-        assert torch.allclose(mask, mask.T)
-
-    def test_mask_ratio(self):
-        n_points = 20
-        mask_ratio = 0.3
-        dataset = DistanceMatrixDataset(
-            n_samples=100, n_points=n_points, mask_ratio=mask_ratio, seed=42
-        )
-
-        total_masked = 0
-        total_pairs = n_points * (n_points - 1)  # Exclude diagonal
-
-        for i in range(len(dataset)):
-            _, mask, _ = dataset[i]
-            # Count unmasked off-diagonal entries
-            unmasked = (mask.sum() - n_points).item()  # Subtract diagonal
-            masked = total_pairs - unmasked
-            total_masked += masked
-
-        avg_mask_ratio = total_masked / (len(dataset) * total_pairs)
-        # Should be close to mask_ratio (within some tolerance)
-        assert abs(avg_mask_ratio - mask_ratio) < 0.05
+        assert item["text"].startswith("<start>")
+        assert item["text"].endswith("<end>")
 
     def test_reproducibility_with_seed(self):
-        dataset1 = DistanceMatrixDataset(n_samples=10, n_points=20, seed=42)
-        dataset2 = DistanceMatrixDataset(n_samples=10, n_points=20, seed=42)
+        dataset1 = DistanceDataset(size=10, n_points=20, seed=42)
+        dataset2 = DistanceDataset(size=10, n_points=20, seed=42)
 
-        d1, m1, p1 = dataset1[5]
-        d2, m2, p2 = dataset2[5]
+        item1 = dataset1[5]
+        item2 = dataset2[5]
 
-        assert torch.allclose(d1, d2)
-        assert torch.allclose(m1, m2)
-        assert torch.allclose(p1, p2)
+        assert item1["text"] == item2["text"]
+        assert np.allclose(item1["coordinates"], item2["coordinates"])
 
 
-class TestDataLoaders:
-    def test_create_dataloaders(self):
-        train_loader, val_loader, test_loader = create_dataloaders(
-            train_samples=100,
-            val_samples=20,
-            test_samples=20,
-            n_points=10,
-            batch_size=16,
-            seed=42,
-        )
+class TestEvalDataset:
+    def test_dataset_length(self):
+        dataset = EvalDataset(size=50, n_points=20, seed=42)
+        assert len(dataset) == 50
 
-        assert len(train_loader.dataset) == 100
-        assert len(val_loader.dataset) == 20
-        assert len(test_loader.dataset) == 20
+    def test_dataset_item_keys(self):
+        dataset = EvalDataset(size=10, n_points=20, n_observed=180, seed=42)
+        item = dataset[0]
 
-    def test_batch_shapes(self):
-        train_loader, _, _ = create_dataloaders(
-            train_samples=100,
-            val_samples=20,
-            test_samples=20,
-            n_points=15,
-            batch_size=8,
-            seed=42,
-        )
+        assert "prompt" in item
+        assert "observed_pairs" in item
+        assert "observed_distances" in item
+        assert "held_out_pairs" in item
+        assert "held_out_distances" in item
+        assert "coordinates" in item
 
-        distances, mask, points = next(iter(train_loader))
+    def test_split_sizes(self):
+        dataset = EvalDataset(size=10, n_points=20, n_observed=180, seed=42)
+        item = dataset[0]
 
-        assert distances.shape == (8, 15, 15)
-        assert mask.shape == (8, 15, 15)
-        assert points.shape == (8, 15, 3)
+        assert len(item["observed_pairs"]) == 180
+        assert len(item["held_out_pairs"]) == 10
+
+
+class TestGetSpecialTokens:
+    def test_includes_start_end(self):
+        tokens = get_special_tokens()
+        assert "<start>" in tokens
+        assert "<end>" in tokens
+
+    def test_includes_point_tokens(self):
+        tokens = get_special_tokens()
+        for i in range(20):
+            assert f"<point {i}>" in tokens
+
+    def test_includes_distance_tokens(self):
+        tokens = get_special_tokens()
+        # Check some distance tokens
+        assert "<0>" in tokens
+        assert "<100>" in tokens
+        assert "<500>" in tokens
+        assert "<1000>" in tokens
+
+    def test_total_token_count(self):
+        tokens = get_special_tokens()
+        # 2 (start/end) + 20 (points) + 1001 (distances 0-1000)
+        assert len(tokens) == 2 + 20 + 1001

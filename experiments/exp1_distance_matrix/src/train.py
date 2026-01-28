@@ -1,140 +1,592 @@
-"""Training script for distance matrix completion experiment."""
+"""Training script for distance matrix LLM experiment.
+
+Fine-tunes Llama 3.2 1B on distance document pretraining data.
+"""
+
+from __future__ import annotations
 
 import argparse
 import json
-import math
+import re
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
-import torch.nn as nn
+from scipy import stats
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    DataCollatorForLanguageModeling,
+    Trainer,
+    TrainerCallback,
+    TrainingArguments,
+)
+
 import wandb
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from .data import create_dataloaders
-from .model import DistanceMatrixLoss, DistanceMatrixTransformer
+from .data import DistanceDataset, EvalDataset, get_special_tokens
 
-
-def train_epoch(
-    model: nn.Module,
-    dataloader: torch.utils.data.DataLoader,
-    optimizer: torch.optim.Optimizer,
-    loss_fn: nn.Module,
-    device: torch.device,
-) -> float:
-    """Train for one epoch."""
-    model.train()
-    total_loss = 0.0
-    n_batches = 0
-
-    for distances, mask, _ in dataloader:
-        distances = distances.to(device)
-        mask = mask.to(device)
-
-        optimizer.zero_grad()
-        pred = model(distances, mask)
-        loss = loss_fn(pred, distances, mask)
-        loss.backward()
-
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-        optimizer.step()
-
-        total_loss += loss.item()
-        n_batches += 1
-
-    return total_loss / n_batches
+if TYPE_CHECKING:
+    from transformers import PreTrainedModel, PreTrainedTokenizer
 
 
-@torch.no_grad()
-def evaluate(
-    model: nn.Module,
-    dataloader: torch.utils.data.DataLoader,
-    loss_fn: nn.Module,
-    device: torch.device,
-) -> dict:
-    """Evaluate the model."""
-    model.eval()
-    total_loss = 0.0
-    total_mae = 0.0
-    n_batches = 0
-    n_masked = 0
+def setup_tokenizer(model_name: str) -> PreTrainedTokenizer:
+    """Set up tokenizer with special tokens for distance task."""
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    for distances, mask, _ in dataloader:
-        distances = distances.to(device)
-        mask = mask.to(device)
+    # Set pad token if not set
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-        pred = model(distances, mask)
-        loss = loss_fn(pred, distances, mask)
+    # Add special tokens
+    special_tokens = get_special_tokens()
+    tokenizer.add_tokens(special_tokens)
 
-        # Compute MAE on masked positions
-        pred_mask = 1 - mask
-        mae = (torch.abs(pred - distances) * pred_mask).sum()
-        n_masked += pred_mask.sum().item()
+    return tokenizer  # type: ignore[return-value]
 
-        total_loss += loss.item()
-        total_mae += mae.item()
-        n_batches += 1
+
+def setup_model(model_name: str, tokenizer: PreTrainedTokenizer) -> PreTrainedModel:
+    """Set up model with resized embeddings for special tokens."""
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+    )
+
+    # Resize embeddings for new tokens
+    model.resize_token_embeddings(len(tokenizer))
+
+    return model
+
+
+class TextDataset(torch.utils.data.Dataset):
+    """Wrapper dataset that returns tokenized text."""
+
+    def __init__(
+        self, dataset: DistanceDataset, tokenizer: PreTrainedTokenizer, max_length: int = 2048
+    ):
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        encoding = self.tokenizer(
+            item["text"],
+            truncation=True,
+            max_length=self.max_length,
+            padding=False,
+            return_tensors=None,
+        )
+        return {
+            "input_ids": encoding["input_ids"],
+            "attention_mask": encoding["attention_mask"],
+        }
+
+
+def parse_model_output(output: str) -> dict[tuple[int, int], int]:
+    """Parse model output to extract predicted distances.
+
+    Args:
+        output: Model generated text.
+
+    Returns:
+        Dictionary mapping (point_i, point_j) pairs to predicted distances.
+    """
+    predictions = {}
+
+    # Pattern to match: <point X><point Y><distance>
+    pattern = r"<point (\d+)><point (\d+)><(\d+)>"
+
+    for match in re.finditer(pattern, output):
+        i = int(match.group(1))
+        j = int(match.group(2))
+        dist = int(match.group(3))
+
+        # Store with canonical key (smaller index first)
+        key = (min(i, j), max(i, j))
+        predictions[key] = dist
+
+    return predictions
+
+
+def check_output_structure(generated_text: str, prompt: str) -> dict[str, bool]:
+    """Check if the generated output has correct structure.
+
+    Args:
+        generated_text: Full generated text (includes prompt echo).
+        prompt: The original prompt.
+
+    Returns:
+        Dictionary with structure check results.
+    """
+    # Get only the newly generated part (after the prompt)
+    # The prompt ends without <end>, so we look for content after the prompt
+    if prompt in generated_text:
+        new_content = generated_text[generated_text.find(prompt) + len(prompt) :]
+    else:
+        new_content = generated_text
+
+    # Check if it ends with <end>
+    ends_with_end = "<end>" in new_content
+
+    # Check syntax: everything between <start> and <end> should be valid pairs
+    # Valid format: lines of <point X><point Y><distance>
+    syntax_valid = True
+
+    # Extract content between markers
+    full_content = generated_text
+    if "<start>" in full_content:
+        start_idx = full_content.find("<start>") + len("<start>")
+        end_idx = full_content.find("<end>") if "<end>" in full_content else len(full_content)
+        content = full_content[start_idx:end_idx]
+
+        # Each non-empty line should match the pattern
+        pair_pattern = r"^<point \d+><point \d+><\d+>$"
+        for line in content.strip().split("\n"):
+            line = line.strip()
+            if line and not re.match(pair_pattern, line):
+                syntax_valid = False
+                break
 
     return {
-        "loss": total_loss / n_batches,
-        "mae": total_mae / n_masked if n_masked > 0 else 0.0,
-        "rmse": math.sqrt(total_loss / n_batches),
+        "ends_with_end": ends_with_end,
+        "syntax_valid": syntax_valid,
+        "structure_correct": ends_with_end and syntax_valid,
     }
+
+
+def check_correct_pairs(
+    predictions: dict[tuple[int, int], int],
+    observed_pairs: list[tuple[int, int]],
+    held_out_pairs: list[tuple[int, int]],
+) -> dict[str, Any]:
+    """Check if the model predicted exactly the right pairs.
+
+    Args:
+        predictions: Dictionary of predicted (pair -> distance).
+        observed_pairs: List of pairs that were in the prompt.
+        held_out_pairs: List of pairs that should be predicted.
+
+    Returns:
+        Dictionary with pair accuracy metrics.
+    """
+    # Get canonical versions of all pairs
+    observed_canonical = {(min(i, j), max(i, j)) for i, j in observed_pairs}
+    held_out_canonical = {(min(i, j), max(i, j)) for i, j in held_out_pairs}
+    predicted_pairs = set(predictions.keys())
+
+    # New pairs are those not in observed
+    new_predicted = predicted_pairs - observed_canonical
+
+    # Check if new predictions exactly match held-out pairs
+    correct_new_pairs = new_predicted == held_out_canonical
+
+    # How many of the held-out pairs were predicted?
+    held_out_predicted = held_out_canonical & predicted_pairs
+    held_out_recall = len(held_out_predicted) / len(held_out_canonical) if held_out_canonical else 0
+
+    # How many of the new predictions were actually held-out pairs?
+    held_out_precision = (
+        len(held_out_predicted & new_predicted) / len(new_predicted) if new_predicted else 0
+    )
+
+    return {
+        "correct_new_pairs": correct_new_pairs,
+        "held_out_recall": held_out_recall,
+        "held_out_precision": held_out_precision,
+        "n_new_predicted": len(new_predicted),
+        "n_held_out": len(held_out_canonical),
+        "n_held_out_found": len(held_out_predicted),
+    }
+
+
+def evaluate_model(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    eval_dataset: EvalDataset,
+    device: torch.device,
+    n_examples: int = 100,
+    log_examples: int = 5,
+) -> dict[str, Any]:
+    """Evaluate model on held-out distance prediction.
+
+    Args:
+        model: The fine-tuned model.
+        tokenizer: The tokenizer.
+        eval_dataset: Evaluation dataset with observed/held-out splits.
+        device: Device to run on.
+        n_examples: Number of examples to evaluate.
+        log_examples: Number of full examples to log.
+
+    Returns:
+        Dictionary with evaluation metrics.
+    """
+    model.eval()
+
+    all_pred_distances = []
+    all_true_distances = []
+    logged_examples = []
+
+    # New metrics
+    n_correct_pairs = 0
+    n_correct_structure = 0
+    total_held_out_recall = 0.0
+    total_held_out_precision = 0.0
+
+    n_examples = min(n_examples, len(eval_dataset))
+
+    for idx in range(n_examples):
+        example = eval_dataset[idx]
+        prompt = example["prompt"]
+
+        held_out_pairs = example["held_out_pairs"]
+        observed_pairs = example["observed_pairs"]
+
+        # Tokenize and generate
+        inputs = tokenizer(prompt, return_tensors="pt")  # type: ignore[misc]
+        inputs = {k: v.to(device) for k, v in inputs.items()}  # type: ignore[union-attr]
+
+        with torch.no_grad():
+            outputs = model.generate(  # type: ignore[operator]
+                **inputs,
+                max_new_tokens=200,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+
+        generated_text = str(tokenizer.decode(outputs[0], skip_special_tokens=False))
+
+        # Parse predictions
+        predictions = parse_model_output(generated_text)
+
+        # Check structure
+        structure_info = check_output_structure(generated_text, prompt)
+        if structure_info["structure_correct"]:
+            n_correct_structure += 1
+
+        # Check pairs
+        pairs_info = check_correct_pairs(predictions, observed_pairs, held_out_pairs)
+        if pairs_info["correct_new_pairs"]:
+            n_correct_pairs += 1
+        total_held_out_recall += pairs_info["held_out_recall"]
+        total_held_out_precision += pairs_info["held_out_precision"]
+
+        # Get true distances for held-out pairs
+        held_out_distances = example["held_out_distances"]
+
+        for (i, j), true_dist in zip(held_out_pairs, held_out_distances):
+            key = (min(i, j), max(i, j))
+            if key in predictions:
+                all_pred_distances.append(predictions[key])
+                all_true_distances.append(true_dist)
+
+        # Log full examples
+        if idx < log_examples:
+            logged_examples.append(
+                {
+                    "prompt": prompt,
+                    "generated": generated_text,
+                    "held_out_pairs": [(i, j) for i, j in held_out_pairs],
+                    "held_out_distances": held_out_distances,
+                    "predictions": {f"({k[0]},{k[1]})": v for k, v in predictions.items()},
+                    "structure_correct": structure_info["structure_correct"],
+                    "correct_new_pairs": pairs_info["correct_new_pairs"],
+                    "held_out_recall": pairs_info["held_out_recall"],
+                }
+            )
+
+    # Compute metrics
+    if len(all_pred_distances) > 0:
+        pred_arr = np.array(all_pred_distances)
+        true_arr = np.array(all_true_distances)
+
+        mae = np.mean(np.abs(pred_arr - true_arr))
+        pearson_r, pearson_p = stats.pearsonr(pred_arr, true_arr)
+    else:
+        mae = float("nan")
+        pearson_r = float("nan")
+        pearson_p = float("nan")
+
+    return {
+        "mae": mae,
+        "pearson_r": pearson_r,
+        "pearson_p": pearson_p,
+        "n_predictions": len(all_pred_distances),
+        "n_examples": n_examples,
+        "logged_examples": logged_examples,
+        # New metrics
+        "pct_correct_pairs": 100 * n_correct_pairs / n_examples if n_examples > 0 else 0,
+        "pct_correct_structure": 100 * n_correct_structure / n_examples if n_examples > 0 else 0,
+        "avg_held_out_recall": total_held_out_recall / n_examples if n_examples > 0 else 0,
+        "avg_held_out_precision": total_held_out_precision / n_examples if n_examples > 0 else 0,
+        # Raw data for plotting
+        "all_pred_distances": all_pred_distances,
+        "all_true_distances": all_true_distances,
+    }
+
+
+class ExampleLoggingCallback(TrainerCallback):
+    """Callback to log example predictions during evaluation."""
+
+    def __init__(
+        self,
+        eval_dataset: EvalDataset,
+        tokenizer: PreTrainedTokenizer,
+        log_examples: int = 5,
+        use_wandb: bool = True,
+    ):
+        self.eval_dataset = eval_dataset
+        self.tokenizer = tokenizer
+        self.log_examples = log_examples
+        self.use_wandb = use_wandb
+
+    def on_evaluate(self, args, state, control, model, **kwargs):
+        """Run example evaluation after each eval step."""
+        device = next(model.parameters()).device
+
+        # Run evaluation with examples
+        eval_results = evaluate_model(
+            model=model,
+            tokenizer=self.tokenizer,
+            eval_dataset=self.eval_dataset,
+            device=device,
+            n_examples=min(20, len(self.eval_dataset)),  # Evaluate on subset for speed
+            log_examples=self.log_examples,
+        )
+
+        # Print to terminal
+        print(f"\n[Step {state.global_step}] Example Evaluation:")
+        print(f"  MAE: {eval_results['mae']:.4f}")
+        print(f"  Pearson r: {eval_results['pearson_r']:.4f}")
+        print(f"  N predictions: {eval_results['n_predictions']}")
+        print(f"  % correct pairs: {eval_results['pct_correct_pairs']:.1f}%")
+        print(f"  % correct structure: {eval_results['pct_correct_structure']:.1f}%")
+        print(f"  Avg held-out recall: {eval_results['avg_held_out_recall']:.2f}")
+
+        # Log one example to terminal
+        if eval_results["logged_examples"]:
+            ex = eval_results["logged_examples"][0]
+            print("\n  Sample prediction:")
+            print(f"  Held-out pairs: {ex['held_out_pairs'][:5]}...")
+            print(f"  True distances: {ex['held_out_distances'][:5]}...")
+            # Show which held-out pairs were predicted
+            held_out_canonical = {(min(i, j), max(i, j)) for i, j in ex["held_out_pairs"]}
+            matched_preds = {
+                k: v
+                for k, v in ex["predictions"].items()
+                if tuple(map(int, k.strip("()").split(","))) in held_out_canonical
+            }
+            print(f"  Matched predictions: {matched_preds}")
+
+        # Log to wandb
+        if self.use_wandb and wandb.run is not None:
+            wandb.log(
+                {
+                    "eval_examples/mae": eval_results["mae"],
+                    "eval_examples/pearson_r": eval_results["pearson_r"],
+                    "eval_examples/n_predictions": eval_results["n_predictions"],
+                    "eval_examples/pct_correct_pairs": eval_results["pct_correct_pairs"],
+                    "eval_examples/pct_correct_structure": eval_results["pct_correct_structure"],
+                    "eval_examples/avg_held_out_recall": eval_results["avg_held_out_recall"],
+                    "eval_examples/avg_held_out_precision": eval_results["avg_held_out_precision"],
+                    "global_step": state.global_step,
+                }
+            )
+
+            # Log scatterplot of predicted vs true distances
+            if eval_results["all_pred_distances"] and eval_results["all_true_distances"]:
+                scatter_data = [
+                    [true_d, pred_d]
+                    for true_d, pred_d in zip(
+                        eval_results["all_true_distances"],
+                        eval_results["all_pred_distances"],
+                    )
+                ]
+                scatter_table = wandb.Table(
+                    data=scatter_data, columns=["true_distance", "predicted_distance"]
+                )
+                wandb.log(
+                    {
+                        f"eval_examples/scatter_step_{state.global_step}": wandb.plot.scatter(
+                            scatter_table,
+                            "true_distance",
+                            "predicted_distance",
+                            title=f"Predicted vs True Distances (Step {state.global_step})",
+                        )
+                    }
+                )
+
+            # Log examples as a table
+            example_table = wandb.Table(
+                columns=[
+                    "step",
+                    "prompt_preview",
+                    "generated_preview",
+                    "held_out_pairs",
+                    "true_distances",
+                    "matched_predictions",
+                    "structure_correct",
+                    "correct_pairs",
+                ]
+            )
+            for ex in eval_results["logged_examples"]:
+                # Get matched predictions for held-out pairs
+                held_out_canonical = {(min(i, j), max(i, j)) for i, j in ex["held_out_pairs"]}
+                matched = {
+                    k: v
+                    for k, v in ex["predictions"].items()
+                    if tuple(map(int, k.strip("()").split(","))) in held_out_canonical
+                }
+                example_table.add_data(
+                    state.global_step,
+                    ex["prompt"][:500] + "...",  # Truncate for readability
+                    ex["generated"][-500:],  # Show end of generation
+                    str(ex["held_out_pairs"]),
+                    str(ex["held_out_distances"]),
+                    str(matched),
+                    ex.get("structure_correct", False),
+                    ex.get("correct_new_pairs", False),
+                )
+            wandb.log({f"eval_examples/examples_step_{state.global_step}": example_table})
 
 
 def train(
-    n_points: int = 20,
-    mask_ratio: float = 0.3,
-    d_model: int = 256,
-    n_heads: int = 8,
-    n_layers: int = 6,
-    d_ff: int = 1024,
-    dropout: float = 0.1,
-    batch_size: int = 64,
-    lr: float = 1e-4,
-    n_epochs: int = 100,
+    model_name: str = "meta-llama/Llama-3.2-1B",
     train_samples: int = 10000,
-    val_samples: int = 1000,
-    test_samples: int = 1000,
+    val_samples: int = 500,
+    eval_samples: int = 100,
+    n_points: int = 20,
+    coord_std: float = 100.0,
+    n_observed: int = 180,
+    batch_size: int = 4,
+    gradient_accumulation_steps: int = 8,
+    lr: float = 2e-5,
+    n_epochs: int = 3,
+    warmup_ratio: float = 0.1,
     seed: int = 42,
-    output_dir: str = "outputs",
-    device: str | None = None,
+    output_dir: str = "outputs/exp1",
     use_wandb: bool = True,
-    wandb_project: str = "distance-matrix-completion",
+    wandb_project: str = "distance-llm",
     wandb_run_name: str | None = None,
-) -> dict:
-    """Train the distance matrix completion model."""
-    # Setup
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    device = torch.device(device)
-    print(f"Using device: {device}")
+    log_examples: int = 5,
+) -> dict[str, Any]:
+    """Train the distance prediction LLM.
 
+    Args:
+        model_name: HuggingFace model name.
+        train_samples: Number of training documents.
+        val_samples: Number of validation documents.
+        eval_samples: Number of evaluation examples.
+        n_points: Number of points per document.
+        coord_std: Standard deviation of point coordinates.
+        n_observed: Number of observed pairs in eval (rest are held out).
+        batch_size: Training batch size per device.
+        gradient_accumulation_steps: Gradient accumulation steps.
+        lr: Learning rate.
+        n_epochs: Number of training epochs.
+        warmup_ratio: Warmup ratio.
+        seed: Random seed.
+        output_dir: Output directory.
+        use_wandb: Whether to use wandb logging.
+        wandb_project: Wandb project name.
+        wandb_run_name: Wandb run name.
+        log_examples: Number of examples to log in full.
+
+    Returns:
+        Dictionary with training results.
+    """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Set random seed
+    # Set seed
     torch.manual_seed(seed)
+    np.random.seed(seed)
 
-    # Config dict for logging
+    # Config for logging
     config = {
-        "n_points": n_points,
-        "mask_ratio": mask_ratio,
-        "d_model": d_model,
-        "n_heads": n_heads,
-        "n_layers": n_layers,
-        "d_ff": d_ff,
-        "dropout": dropout,
-        "batch_size": batch_size,
-        "lr": lr,
-        "n_epochs": n_epochs,
+        "model_name": model_name,
         "train_samples": train_samples,
         "val_samples": val_samples,
-        "test_samples": test_samples,
+        "eval_samples": eval_samples,
+        "n_points": n_points,
+        "coord_std": coord_std,
+        "n_observed": n_observed,
+        "batch_size": batch_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "lr": lr,
+        "n_epochs": n_epochs,
+        "warmup_ratio": warmup_ratio,
         "seed": seed,
     }
+
+    print("Setting up tokenizer and model...")
+    tokenizer = setup_tokenizer(model_name)
+    model = setup_model(model_name, tokenizer)
+
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"Vocabulary size: {len(tokenizer)}")
+
+    print("Creating datasets...")
+    train_dataset = DistanceDataset(
+        size=train_samples,
+        n_points=n_points,
+        std=coord_std,
+        seed=seed,
+    )
+    val_dataset = DistanceDataset(
+        size=val_samples,
+        n_points=n_points,
+        std=coord_std,
+        seed=seed + 100000,
+    )
+    eval_dataset = EvalDataset(
+        size=eval_samples,
+        n_points=n_points,
+        std=coord_std,
+        n_observed=n_observed,
+        seed=seed + 200000,
+    )
+
+    # Wrap with tokenization
+    train_text_dataset = TextDataset(train_dataset, tokenizer)
+    val_text_dataset = TextDataset(val_dataset, tokenizer)
+
+    # Data collator
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False,
+    )
+
+    # Training arguments
+    training_args = TrainingArguments(
+        output_dir=str(output_path),
+        num_train_epochs=n_epochs,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        learning_rate=lr,
+        warmup_ratio=warmup_ratio,
+        weight_decay=0.01,
+        logging_steps=10,
+        eval_strategy="steps",
+        eval_steps=500,
+        save_strategy="steps",
+        save_steps=500,
+        save_total_limit=2,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        bf16=True,
+        dataloader_num_workers=4,
+        report_to="wandb" if use_wandb else "none",
+        run_name=wandb_run_name,
+        seed=seed,
+    )
 
     # Initialize wandb
     if use_wandb:
@@ -144,107 +596,143 @@ def train(
             config=config,
         )
 
-    # Create dataloaders
-    train_loader, val_loader, test_loader = create_dataloaders(
-        train_samples=train_samples,
-        val_samples=val_samples,
-        test_samples=test_samples,
-        n_points=n_points,
-        mask_ratio=mask_ratio,
-        batch_size=batch_size,
-        seed=seed,
+    # Create example logging callback
+    example_callback = ExampleLoggingCallback(
+        eval_dataset=eval_dataset,
+        tokenizer=tokenizer,
+        log_examples=log_examples,
+        use_wandb=use_wandb,
     )
 
-    # Create model
-    model = DistanceMatrixTransformer(
-        d_model=d_model,
-        n_heads=n_heads,
-        n_layers=n_layers,
-        d_ff=d_ff,
-        dropout=dropout,
-        max_points=n_points + 10,
-    ).to(device)
+    # Create trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_text_dataset,
+        eval_dataset=val_text_dataset,
+        data_collator=data_collator,
+        callbacks=[example_callback],
+    )
 
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model parameters: {n_params:,}")
+    # Train
+    print("Starting training...")
+    train_result = trainer.train()
 
+    # Save model
+    trainer.save_model(str(output_path / "final_model"))
+    tokenizer.save_pretrained(str(output_path / "final_model"))
+
+    # Evaluate
+    print("Evaluating model...")
+    device = next(model.parameters()).device
+    eval_results = evaluate_model(
+        model=model,
+        tokenizer=tokenizer,
+        eval_dataset=eval_dataset,
+        device=device,
+        n_examples=eval_samples,
+        log_examples=log_examples,
+    )
+
+    print("\nEvaluation Results:")
+    print(f"  MAE: {eval_results['mae']:.4f}")
+    print(f"  Pearson r: {eval_results['pearson_r']:.4f}")
+    print(f"  N predictions: {eval_results['n_predictions']}")
+    print(f"  % correct pairs: {eval_results['pct_correct_pairs']:.1f}%")
+    print(f"  % correct structure: {eval_results['pct_correct_structure']:.1f}%")
+    print(f"  Avg held-out recall: {eval_results['avg_held_out_recall']:.2f}")
+    print(f"  Avg held-out precision: {eval_results['avg_held_out_precision']:.2f}")
+
+    # Log examples to terminal
+    print(f"\n{'=' * 80}")
+    print("LOGGED EXAMPLES")
+    print("=" * 80)
+    for i, example in enumerate(eval_results["logged_examples"]):
+        print(f"\n--- Example {i + 1} ---")
+        print(f"PROMPT:\n{example['prompt']}")
+        print(f"\nGENERATED:\n{example['generated']}")
+        print(f"\nHELD OUT PAIRS: {example['held_out_pairs']}")
+        print(f"TRUE DISTANCES: {example['held_out_distances']}")
+        print(f"PREDICTIONS: {example['predictions']}")
+        print(f"STRUCTURE CORRECT: {example.get('structure_correct', 'N/A')}")
+        print(f"CORRECT PAIRS: {example.get('correct_new_pairs', 'N/A')}")
+        print("-" * 40)
+
+    # Log to wandb
     if use_wandb:
-        wandb.config.update({"n_params": n_params})
+        wandb.log(
+            {
+                "eval/mae": eval_results["mae"],
+                "eval/pearson_r": eval_results["pearson_r"],
+                "eval/n_predictions": eval_results["n_predictions"],
+                "eval/pct_correct_pairs": eval_results["pct_correct_pairs"],
+                "eval/pct_correct_structure": eval_results["pct_correct_structure"],
+                "eval/avg_held_out_recall": eval_results["avg_held_out_recall"],
+                "eval/avg_held_out_precision": eval_results["avg_held_out_precision"],
+            }
+        )
 
-    # Loss and optimizer
-    loss_fn = DistanceMatrixLoss()
-    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.01)
-    scheduler = CosineAnnealingLR(optimizer, T_max=n_epochs)
-
-    # Training loop
-    best_val_loss = float("inf")
-    history = {"train_loss": [], "val_loss": [], "val_mae": [], "val_rmse": []}
-
-    for epoch in range(n_epochs):
-        train_loss = train_epoch(model, train_loader, optimizer, loss_fn, device)
-        val_metrics = evaluate(model, val_loader, loss_fn, device)
-        current_lr = scheduler.get_last_lr()[0]
-        scheduler.step()
-
-        history["train_loss"].append(train_loss)
-        history["val_loss"].append(val_metrics["loss"])
-        history["val_mae"].append(val_metrics["mae"])
-        history["val_rmse"].append(val_metrics["rmse"])
-
-        # Log to wandb
-        if use_wandb:
-            wandb.log({
-                "epoch": epoch + 1,
-                "train/loss": train_loss,
-                "val/loss": val_metrics["loss"],
-                "val/mae": val_metrics["mae"],
-                "val/rmse": val_metrics["rmse"],
-                "lr": current_lr,
-            })
-
-        # Save best model
-        if val_metrics["loss"] < best_val_loss:
-            best_val_loss = val_metrics["loss"]
-            torch.save(model.state_dict(), output_path / "best_model.pt")
-            if use_wandb:
-                wandb.run.summary["best_val_loss"] = best_val_loss
-                wandb.run.summary["best_epoch"] = epoch + 1
-
-        if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(
-                f"Epoch {epoch+1}/{n_epochs} | "
-                f"Train Loss: {train_loss:.6f} | "
-                f"Val Loss: {val_metrics['loss']:.6f} | "
-                f"Val MAE: {val_metrics['mae']:.4f} | "
-                f"Val RMSE: {val_metrics['rmse']:.4f}"
+        # Log scatterplot
+        if eval_results["all_pred_distances"] and eval_results["all_true_distances"]:
+            scatter_data = [
+                [true_d, pred_d]
+                for true_d, pred_d in zip(
+                    eval_results["all_true_distances"],
+                    eval_results["all_pred_distances"],
+                )
+            ]
+            scatter_table = wandb.Table(
+                data=scatter_data, columns=["true_distance", "predicted_distance"]
+            )
+            wandb.log(
+                {
+                    "eval/scatter_final": wandb.plot.scatter(
+                        scatter_table,
+                        "true_distance",
+                        "predicted_distance",
+                        title="Final: Predicted vs True Distances",
+                    )
+                }
             )
 
-    # Load best model and evaluate on test set
-    model.load_state_dict(torch.load(output_path / "best_model.pt", weights_only=True))
-    test_metrics = evaluate(model, test_loader, loss_fn, device)
-    print(
-        f"\nTest Results: Loss: {test_metrics['loss']:.6f} | "
-        f"MAE: {test_metrics['mae']:.4f} | RMSE: {test_metrics['rmse']:.4f}"
-    )
+        # Log examples as a table
+        example_table = wandb.Table(
+            columns=[
+                "prompt",
+                "generated",
+                "held_out_pairs",
+                "true_distances",
+                "predictions",
+                "structure_correct",
+                "correct_pairs",
+            ]
+        )
+        for example in eval_results["logged_examples"]:
+            example_table.add_data(
+                example["prompt"],
+                example["generated"],
+                str(example["held_out_pairs"]),
+                str(example["held_out_distances"]),
+                str(example["predictions"]),
+                example.get("structure_correct", False),
+                example.get("correct_new_pairs", False),
+            )
+        wandb.log({"eval/examples": example_table})
 
-    # Log test metrics to wandb
-    if use_wandb:
-        wandb.log({
-            "test/loss": test_metrics["loss"],
-            "test/mae": test_metrics["mae"],
-            "test/rmse": test_metrics["rmse"],
-        })
-        wandb.run.summary["test_loss"] = test_metrics["loss"]
-        wandb.run.summary["test_mae"] = test_metrics["mae"]
-        wandb.run.summary["test_rmse"] = test_metrics["rmse"]
+        if wandb.run is not None:
+            wandb.run.summary["eval_mae"] = eval_results["mae"]
+            wandb.run.summary["eval_pearson_r"] = eval_results["pearson_r"]
+            wandb.run.summary["eval_pct_correct_pairs"] = eval_results["pct_correct_pairs"]
+            wandb.run.summary["eval_pct_correct_structure"] = eval_results["pct_correct_structure"]
         wandb.finish()
 
     # Save results
-    config["n_params"] = n_params
     results = {
         "config": config,
-        "test_metrics": test_metrics,
-        "history": history,
+        "train_loss": train_result.training_loss,
+        "eval_mae": eval_results["mae"],
+        "eval_pearson_r": eval_results["pearson_r"],
+        "eval_n_predictions": eval_results["n_predictions"],
     }
 
     with open(output_path / "results.json", "w") as f:
@@ -254,48 +742,49 @@ def train(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train distance matrix completion model")
-    parser.add_argument("--n-points", type=int, default=20)
-    parser.add_argument("--mask-ratio", type=float, default=0.3)
-    parser.add_argument("--d-model", type=int, default=256)
-    parser.add_argument("--n-heads", type=int, default=8)
-    parser.add_argument("--n-layers", type=int, default=6)
-    parser.add_argument("--d-ff", type=int, default=1024)
-    parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--n-epochs", type=int, default=100)
+    parser = argparse.ArgumentParser(description="Train distance prediction LLM")
+    parser.add_argument(
+        "--model-name", type=str, default="meta-llama/Llama-3.2-1B", help="HuggingFace model name"
+    )
     parser.add_argument("--train-samples", type=int, default=10000)
-    parser.add_argument("--val-samples", type=int, default=1000)
-    parser.add_argument("--test-samples", type=int, default=1000)
+    parser.add_argument("--val-samples", type=int, default=500)
+    parser.add_argument("--eval-samples", type=int, default=100)
+    parser.add_argument("--n-points", type=int, default=20)
+    parser.add_argument("--coord-std", type=float, default=100.0)
+    parser.add_argument("--n-observed", type=int, default=180)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--n-epochs", type=int, default=3)
+    parser.add_argument("--warmup-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default="outputs/exp1")
-    parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
-    parser.add_argument("--wandb-project", type=str, default="distance-matrix-completion")
+    parser.add_argument("--wandb-project", type=str, default="distance-llm")
     parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument("--log-examples", type=int, default=5)
 
     args = parser.parse_args()
+
     train(
-        n_points=args.n_points,
-        mask_ratio=args.mask_ratio,
-        d_model=args.d_model,
-        n_heads=args.n_heads,
-        n_layers=args.n_layers,
-        d_ff=args.d_ff,
-        dropout=args.dropout,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        n_epochs=args.n_epochs,
+        model_name=args.model_name,
         train_samples=args.train_samples,
         val_samples=args.val_samples,
-        test_samples=args.test_samples,
+        eval_samples=args.eval_samples,
+        n_points=args.n_points,
+        coord_std=args.coord_std,
+        n_observed=args.n_observed,
+        batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        lr=args.lr,
+        n_epochs=args.n_epochs,
+        warmup_ratio=args.warmup_ratio,
         seed=args.seed,
         output_dir=args.output_dir,
-        device=args.device,
         use_wandb=not args.no_wandb,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
+        log_examples=args.log_examples,
     )
 
 

@@ -299,6 +299,7 @@ def evaluate_model(
 
         # Tokenize and generate
         inputs = tokenizer(prompt, return_tensors="pt")  # type: ignore[misc]
+        prompt_length = inputs["input_ids"].shape[1]
         inputs = {k: v.to(device) for k, v in inputs.items()}  # type: ignore[union-attr]
 
         with torch.no_grad():
@@ -309,7 +310,10 @@ def evaluate_model(
                 pad_token_id=tokenizer.pad_token_id,
             )
 
+        # Decode full output and just the new tokens
         generated_text = str(tokenizer.decode(outputs[0], skip_special_tokens=False))
+        new_tokens = outputs[0][prompt_length:]
+        new_text = str(tokenizer.decode(new_tokens, skip_special_tokens=False))
 
         # Parse predictions
         predictions = parse_model_output(generated_text)
@@ -341,6 +345,8 @@ def evaluate_model(
                 {
                     "prompt": prompt,
                     "generated": generated_text,
+                    "new_text": new_text,
+                    "prompt_tokens": prompt_length,
                     "held_out_pairs": [(i, j) for i, j in held_out_pairs],
                     "held_out_distances": held_out_distances,
                     "predictions": {f"({k[0]},{k[1]})": v for k, v in predictions.items()},
@@ -422,6 +428,8 @@ class ExampleLoggingCallback(TrainerCallback):
         if eval_results["logged_examples"]:
             ex = eval_results["logged_examples"][0]
             print("\n  Sample prediction:")
+            print(f"  Prompt tokens: {ex.get('prompt_tokens', 'N/A')}")
+            print(f"  NEW TOKENS ONLY: {ex.get('new_text', 'N/A')[:200]}")
             print(f"  Held-out pairs: {ex['held_out_pairs'][:5]}...")
             print(f"  True distances: {ex['held_out_distances'][:5]}...")
             # Show which held-out pairs were predicted
@@ -475,8 +483,8 @@ class ExampleLoggingCallback(TrainerCallback):
             example_table = wandb.Table(
                 columns=[
                     "step",
-                    "prompt_preview",
-                    "generated_preview",
+                    "prompt_tokens",
+                    "new_text",
                     "held_out_pairs",
                     "true_distances",
                     "matched_predictions",
@@ -494,8 +502,8 @@ class ExampleLoggingCallback(TrainerCallback):
                 }
                 example_table.add_data(
                     state.global_step,
-                    ex["prompt"],
-                    ex["generated"],
+                    ex.get("prompt_tokens", 0),
+                    ex.get("new_text", ""),
                     str(ex["held_out_pairs"]),
                     str(ex["held_out_distances"]),
                     str(matched),
@@ -743,8 +751,9 @@ def train(
     print("=" * 80)
     for i, example in enumerate(eval_results["logged_examples"]):
         print(f"\n--- Example {i + 1} ---")
-        print(f"PROMPT:\n{example['prompt']}")
-        print(f"\nGENERATED:\n{example['generated']}")
+        print(f"PROMPT TOKENS: {example.get('prompt_tokens', 'N/A')}")
+        print(f"PROMPT (first 500 chars):\n{example['prompt'][:500]}...")
+        print(f"\nNEW TOKENS ONLY:\n{example.get('new_text', 'N/A')}")
         print(f"\nHELD OUT PAIRS: {example['held_out_pairs']}")
         print(f"TRUE DISTANCES: {example['held_out_distances']}")
         print(f"PREDICTIONS: {example['predictions']}")
@@ -792,8 +801,8 @@ def train(
         # Log examples as a table
         example_table = wandb.Table(
             columns=[
-                "prompt",
-                "generated",
+                "prompt_tokens",
+                "new_text",
                 "held_out_pairs",
                 "true_distances",
                 "predictions",
@@ -803,8 +812,8 @@ def train(
         )
         for example in eval_results["logged_examples"]:
             example_table.add_data(
-                example["prompt"],
-                example["generated"],
+                example.get("prompt_tokens", 0),
+                example.get("new_text", ""),
                 str(example["held_out_pairs"]),
                 str(example["held_out_distances"]),
                 str(example["predictions"]),

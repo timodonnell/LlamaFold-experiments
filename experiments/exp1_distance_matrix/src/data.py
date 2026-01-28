@@ -19,12 +19,17 @@ class DistanceDocument:
     pairs: list[tuple[int, int]]  # List of (point_i, point_j) pairs
     distances: list[int]  # Corresponding integer distances
 
-    def to_text(self) -> str:
-        """Convert to text format for LLM training."""
+    def to_text(self, include_end: bool = True) -> str:
+        """Convert to text format for LLM training.
+
+        Args:
+            include_end: Whether to include <end> token. Set False for eval prompts.
+        """
         lines = ["<start>"]
         for (i, j), dist in zip(self.pairs, self.distances):
             lines.append(f"<point {i}><point {j}><{dist}>")
-        lines.append("<end>")
+        if include_end:
+            lines.append("<end>")
         return "\n".join(lines)
 
 
@@ -236,7 +241,7 @@ class EvalDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         example = self.examples[idx]
         return {
-            "prompt": example["observed"].to_text(),
+            "prompt": example["observed"].to_text(include_end=False),
             "observed_pairs": example["observed"].pairs,
             "observed_distances": example["observed"].distances,
             "held_out_pairs": example["held_out"].pairs,

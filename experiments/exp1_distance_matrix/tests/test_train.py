@@ -5,23 +5,23 @@ from experiments.exp1_distance_matrix.src.train import parse_model_output
 
 class TestParseModelOutput:
     def test_parse_single_pair(self):
-        output = "<point 0><point 1><123>"
+        output = "<p0> <p1> <d123>"
         predictions = parse_model_output(output)
         assert predictions == {(0, 1): 123}
 
     def test_parse_multiple_pairs(self):
-        output = "<point 0><point 1><100>\n<point 2><point 5><200>\n<point 10><point 15><300>"
+        output = "<p0> <p1> <d100>\n<p2> <p5> <d200>\n<p10> <p15> <d300>"
         predictions = parse_model_output(output)
         assert predictions == {(0, 1): 100, (2, 5): 200, (10, 15): 300}
 
     def test_canonical_ordering(self):
         # Even if output has reversed order, key should be canonical
-        output = "<point 5><point 2><150>"
+        output = "<p5> <p2> <d150>"
         predictions = parse_model_output(output)
         assert predictions == {(2, 5): 150}
 
     def test_parse_with_surrounding_text(self):
-        output = "some text <point 3><point 7><42> more text"
+        output = "some text <p3> <p7> <d42> more text"
         predictions = parse_model_output(output)
         assert predictions == {(3, 7): 42}
 
@@ -32,9 +32,9 @@ class TestParseModelOutput:
 
     def test_parse_full_document(self):
         output = """<start>
-<point 0><point 1><100>
-<point 0><point 2><150>
-<point 1><point 2><200>
+<p0> <p1> <d100>
+<p0> <p2> <d150>
+<p1> <p2> <d200>
 <end>"""
         predictions = parse_model_output(output)
         assert len(predictions) == 3
@@ -44,6 +44,12 @@ class TestParseModelOutput:
 
     def test_last_value_wins_for_duplicate_pairs(self):
         # If same pair appears twice, last value wins
-        output = "<point 0><point 1><100>\n<point 0><point 1><200>"
+        output = "<p0> <p1> <d100>\n<p0> <p1> <d200>"
         predictions = parse_model_output(output)
         assert predictions == {(0, 1): 200}
+
+    def test_parse_without_spaces(self):
+        # Should also work without spaces between tokens
+        output = "<p0><p1><d123>"
+        predictions = parse_model_output(output)
+        assert predictions == {(0, 1): 123}

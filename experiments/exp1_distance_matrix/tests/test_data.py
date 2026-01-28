@@ -57,7 +57,7 @@ class TestCreateDocument:
 
         assert text.startswith("<start>")
         assert text.endswith("<end>")
-        assert "<point" in text
+        assert "<p" in text
 
     def test_pairs_cover_all_combinations(self):
         coords = generate_coordinates(n_points=5)
@@ -160,17 +160,16 @@ class TestGetSpecialTokens:
     def test_includes_point_tokens(self):
         tokens = get_special_tokens()
         for i in range(20):
-            assert f"<point {i}>" in tokens
+            assert f"<p{i}>" in tokens
 
     def test_includes_distance_tokens(self):
         tokens = get_special_tokens()
         # Check some distance tokens
-        assert "<0>" in tokens
-        assert "<100>" in tokens
-        assert "<500>" in tokens
-        assert "<1000>" in tokens
+        assert "<d0>" in tokens
+        assert "<d100>" in tokens
+        assert "<d500>" in tokens
 
     def test_total_token_count(self):
         tokens = get_special_tokens()
-        # 2 (start/end) + 20 (points) + 1001 (distances 0-1000)
-        assert len(tokens) == 2 + 20 + 1001
+        # 2 (start/end) + 20 (points) + 501 (distances 0-500)
+        assert len(tokens) == 2 + 20 + 501

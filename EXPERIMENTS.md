@@ -3,6 +3,19 @@
 This document describes the derisking experiments for the LLM-based protein structure prediction project.
 
 ## Experiment 1: Distance Matrix Completion
+This is the new description of experiment 1 that I want Claude Code to implement.
+
+**Goal:** Test geometric reasoning ability of transformer models on distance matrices.
+
+**Task:** Given a partially observed distance matrix for random 3D point clouds, predict missing distances.
+
+We are going to sample 20 random coordinates from 
+
+
+
+# OLD STUFF:
+
+## Experiment 1: Distance Matrix Completion
 
 **Goal:** Test geometric reasoning ability of transformer models on distance matrices.
 
@@ -11,6 +24,17 @@ This document describes the derisking experiments for the LLM-based protein stru
 **Success Criteria:** Near-zero loss on held-out distances.
 
 **Extension:** Reconstruct 3D coordinates up to rigid-body transforms.
+
+
+
+
+
+
+
+
+
+
+
 
 ### Running the Experiment
 

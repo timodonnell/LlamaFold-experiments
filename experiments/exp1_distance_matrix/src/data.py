@@ -27,7 +27,8 @@ class DistanceDocument:
         """
         lines = ["<start>"]
         for (i, j), dist in zip(self.pairs, self.distances):
-            lines.append(f"<point {i}><point {j}><{dist}>")
+            # Space-separate tokens so tokenizer can split them
+            lines.append(f"<p{i}> <p{j}> <d{dist}>")
         if include_end:
             lines.append("<end>")
         return "\n".join(lines)
@@ -253,11 +254,11 @@ class EvalDataset(Dataset):
 def get_special_tokens() -> list[str]:
     """Get list of special tokens needed for this task."""
     tokens = ["<start>", "<end>"]
-    # Point tokens for 20 points
+    # Point tokens for 20 points (no space, so tokenizer can split)
     for i in range(20):
-        tokens.append(f"<point {i}>")
-    # Distance tokens - max distance with stdev=100 in 3D is roughly 600-800
-    # Use range 0-1000 to be safe
-    for d in range(1001):
-        tokens.append(f"<{d}>")
+        tokens.append(f"<p{i}>")
+    # Distance tokens - max distance with coord_range=100 in 3D is roughly 346
+    # Use range 0-500 to be safe
+    for d in range(501):
+        tokens.append(f"<d{d}>")
     return tokens

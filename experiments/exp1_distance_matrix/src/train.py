@@ -119,8 +119,20 @@ class TextDataset(torch.utils.data.Dataset):
             padding=False,
             return_tensors=None,
         )
+
+        # Crash if any unknown tokens (pad token = 0) are in the input
+        input_ids = encoding["input_ids"]
+        if 0 in input_ids:  # 0 is the pad/unk token
+            # Find which tokens are unknown
+            tokens = item["text"].split()
+            unk_tokens = [t for t in tokens if self.tokenizer.convert_tokens_to_ids(t) == 0]
+            raise ValueError(
+                f"Unknown tokens found in input: {unk_tokens[:10]}... "
+                f"Text preview: {item['text'][:200]}"
+            )
+
         return {
-            "input_ids": encoding["input_ids"],
+            "input_ids": input_ids,
             "attention_mask": encoding["attention_mask"],
         }
 
@@ -136,8 +148,8 @@ def parse_model_output(output: str) -> dict[tuple[int, int], int]:
     """
     predictions = {}
 
-    # Pattern to match: <point X><point Y><distance>
-    pattern = r"<point (\d+)><point (\d+)><(\d+)>"
+    # Pattern to match: <pX> <pY> <dZ> (with optional whitespace)
+    pattern = r"<p(\d+)>\s*<p(\d+)>\s*<d(\d+)>"
 
     for match in re.finditer(pattern, output):
         i = int(match.group(1))
@@ -183,7 +195,7 @@ def check_output_structure(generated_text: str, prompt: str) -> dict[str, bool]:
         content = full_content[start_idx:end_idx]
 
         # Each non-empty line should match the pattern
-        pair_pattern = r"^<point \d+><point \d+><\d+>$"
+        pair_pattern = r"^<p\d+>\s*<p\d+>\s*<d\d+>$"
         for line in content.strip().split("\n"):
             line = line.strip()
             if line and not re.match(pair_pattern, line):

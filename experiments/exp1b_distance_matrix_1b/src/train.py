@@ -530,7 +530,7 @@ def train(
     seed: int = 42,
     output_dir: str = "outputs/exp1b",
     use_wandb: bool = True,
-    wandb_project: str = "distance-llm-1b",
+    wandb_project: str = "distance-llm",
     wandb_run_name: str | None = None,
     log_examples: int = 5,
 ) -> dict[str, Any]:
@@ -864,7 +864,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default="outputs/exp1b")
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
-    parser.add_argument("--wandb-project", type=str, default="distance-llm-1b")
+    parser.add_argument("--wandb-project", type=str, default="distance-llm")
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--log-examples", type=int, default=5)
 

@@ -41,20 +41,22 @@ uv run mypy experiments/ shared/
 
 ```
 experiments/
-├── exp1_distance_matrix/    # LLM-based distance prediction from partial observations
-│   ├── src/
-│   │   ├── data.py          # Data generation: random 3D points → distance documents
-│   │   └── train.py         # Fine-tuning Llama 3.2 1B with CLI
-│   └── tests/
-├── exp2_residue_infilling/  # Predict missing residue coordinates (not yet implemented)
-├── exp3_structure_prediction/ # Full structure from sequence + constraints (not yet implemented)
-shared/                      # Shared utilities across experiments
+├── exp1_distance_matrix/         # ~20M param model, 501 distance tokens (<d0>-<d500>)
+├── exp1b_distance_matrix_1b/     # ~1.2B param model, same tokenization as exp1
+├── exp1c_distance_matrix_decimal/ # ~1B param model, decimal tokenization (26 distance tokens)
+├── exp2_residue_infilling/       # Predict missing residue coordinates (not yet implemented)
+├── exp3_structure_prediction/    # Full structure from sequence + constraints (not yet implemented)
+shared/                           # Shared utilities across experiments
 ```
 
 ## Key Design Decisions
 
 - **Isolated experiments**: Each experiment is self-contained with its own data, model, and training code
 - **On-the-fly data generation**: Datasets generate synthetic data dynamically rather than pre-computing
-- **LLM-based approach**: Experiment 1 fine-tunes Llama 3.2 1B on text-formatted distance documents
-- **Special token format**: Distances represented as `<point X><point Y><distance>` with dedicated tokens
+- **LLM-based approach**: Training small Llama models from scratch on text-formatted distance documents
 - **Held-out evaluation**: Model trained on full documents, evaluated on predicting held-out pairs
+
+### Distance Tokenization
+
+- **exp1/exp1b**: Single token per distance: `<d0>` through `<d500>` (501 tokens)
+- **exp1c**: Decimal format with 3 tokens per distance: `<d000> <d00> <d0>` through `<d500> <d90> <d9>` (26 tokens)

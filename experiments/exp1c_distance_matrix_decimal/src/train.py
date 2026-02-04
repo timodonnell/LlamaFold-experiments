@@ -543,6 +543,7 @@ def train(
     wandb_project: str = "distance-llm",
     wandb_run_name: str | None = None,
     log_examples: int = 5,
+    resume_from_checkpoint: str | bool | None = None,
 ) -> dict[str, Any]:
     """Train the distance prediction LLM from scratch.
 
@@ -564,6 +565,7 @@ def train(
         wandb_project: Wandb project name.
         wandb_run_name: Wandb run name.
         log_examples: Number of examples to log in full.
+        resume_from_checkpoint: Path to checkpoint or True to resume from latest.
 
     Returns:
         Dictionary with training results.
@@ -732,7 +734,7 @@ def train(
 
     # Train
     print("Starting training...")
-    train_result = trainer.train()
+    train_result = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
     # Save model
     trainer.save_model(str(output_path / "final_model"))
@@ -879,8 +881,18 @@ def main():
     parser.add_argument("--wandb-project", type=str, default="distance-llm")
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--log-examples", type=int, default=5)
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        type=str,
+        default=None,
+        help="Path to checkpoint directory, or 'latest' to resume from the latest checkpoint",
+    )
 
     args = parser.parse_args()
+
+    resume = args.resume_from_checkpoint
+    if resume == "latest":
+        resume = True
 
     train(
         train_samples=args.train_samples,
@@ -900,6 +912,7 @@ def main():
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
         log_examples=args.log_examples,
+        resume_from_checkpoint=resume,
     )
 
 

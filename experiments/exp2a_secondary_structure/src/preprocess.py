@@ -1,13 +1,12 @@
 """Preprocess AlphaFold DB CIF files to extract sequences, coordinates, and secondary structure.
 
-Converts .cif.gz files to JSONL format with sequence, backbone coordinates, and
-secondary structure. Uses biotite for secondary structure annotation (no external
-binaries required).
+Converts .cif.gz files to JSONL format with sequence, backbone coordinates, secondary structure,
+and additional DSSP annotations.
 
-Biotite's P-SEA algorithm annotates:
-    'a' -> H (alpha helix)
-    'b' -> E (beta strand)
-    'c' -> C (coil)
+8-state to 3-state mapping:
+    H, G, I -> H (helix)
+    E, B -> E (strand)
+    T, S, C, - -> C (coil)
 
 Output fields per record:
     id: AlphaFold DB identifier
@@ -15,7 +14,11 @@ Output fields per record:
     length: sequence length
     coords_backbone: backbone atom coordinates as [[N_xyz, CA_xyz, C_xyz, O_xyz], ...]
                      where each is [x, y, z] in Angstroms (rounded to 1 decimal)
+    ss8: 8-state secondary structure (H, G, I, E, B, T, S, C, -)
     ss3: 3-state secondary structure (H, E, C)
+    rsa: relative solvent accessibility per residue
+    phi: phi dihedral angles per residue
+    psi: psi dihedral angles per residue
 """
 
 from __future__ import annotations
@@ -25,130 +28,123 @@ import gzip
 import hashlib
 import json
 import sys
+import tempfile
 from multiprocessing import Pool
 from pathlib import Path
 
-import biotite.structure as struc
-import biotite.structure.io.pdbx as pdbx
-import numpy as np
+from Bio.PDB import PDBIO, MMCIFParser
+from Bio.PDB.DSSP import DSSP
 
-# Biotite SSE to our 3-state mapping
-SSE_TO_SS3 = {
-    "a": "H",  # Alpha helix
-    "b": "E",  # Beta strand
-    "c": "C",  # Coil
-    "": "C",  # Not assigned (non-amino acid)
-}
-
-# Standard amino acid 3-letter to 1-letter mapping
-AA_3_TO_1 = {
-    "ALA": "A",
-    "ARG": "R",
-    "ASN": "N",
-    "ASP": "D",
-    "CYS": "C",
-    "GLU": "E",
-    "GLN": "Q",
-    "GLY": "G",
-    "HIS": "H",
-    "ILE": "I",
-    "LEU": "L",
-    "LYS": "K",
-    "MET": "M",
-    "PHE": "F",
-    "PRO": "P",
-    "SER": "S",
-    "THR": "T",
-    "TRP": "W",
-    "TYR": "Y",
-    "VAL": "V",
+# 8-state to 3-state mapping
+SS8_TO_SS3 = {
+    "H": "H",  # Alpha helix
+    "G": "H",  # 3-10 helix
+    "I": "H",  # Pi helix
+    "E": "E",  # Extended strand
+    "B": "E",  # Beta bridge
+    "T": "C",  # Turn
+    "S": "C",  # Bend
+    "C": "C",  # Coil
+    "-": "C",  # Not assigned
+    " ": "C",  # Not assigned (space)
 }
 
 
 def process_cif_file(cif_path: Path) -> dict | None:
-    """Process a single CIF file and extract sequence, coordinates, and SS.
+    """Process a single CIF file and extract sequence, coordinates, and DSSP annotations.
 
     Args:
         cif_path: Path to the .cif.gz file.
 
     Returns:
-        Dictionary with sequence, coordinates, and SS, or None if processing fails.
+        Dictionary with coordinates and DSSP annotations, or None if processing fails.
     """
     try:
-        # Read CIF file
+        # Parse CIF file
+        parser = MMCIFParser(QUIET=True)
+
+        # Handle both .cif.gz and .cif files
         if str(cif_path).endswith(".gz"):
             with gzip.open(cif_path, "rt") as f:
-                cif_file = pdbx.CIFFile.read(f)
+                structure = parser.get_structure("protein", f)
         else:
-            cif_file = pdbx.CIFFile.read(str(cif_path))
+            structure = parser.get_structure("protein", str(cif_path))
 
-        # Get structure (first model)
-        atoms = pdbx.get_structure(cif_file, model=1)
+        # Get the first model
+        model = structure[0]
 
-        # Filter to peptide residues only
-        atoms = atoms[struc.filter_amino_acids(atoms)]
+        # Save as temporary PDB for DSSP
+        with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as tmp_pdb:
+            io = PDBIO()
+            io.set_structure(structure)
+            io.save(tmp_pdb.name)
+            tmp_pdb_path = tmp_pdb.name
 
-        if len(atoms) == 0:
-            return None
+        try:
+            # Run DSSP
+            dssp = DSSP(model, tmp_pdb_path, dssp="mkdssp")
+        finally:
+            # Clean up temp file
+            Path(tmp_pdb_path).unlink(missing_ok=True)
 
-        # Get residue information
-        residue_ids, residue_names = struc.get_residues(atoms)
-
-        # Compute secondary structure using biotite's P-SEA algorithm
-        sse = struc.annotate_sse(atoms)
-
-        # Extract backbone coordinates and build sequence
+        # Extract all DSSP data and backbone coordinates
         sequence = []
-        coords_backbone = []
-        ss3_list = []
+        coords_backbone = []  # [[N_xyz, CA_xyz, C_xyz, O_xyz], ...]
+        ss8_list = []
+        rsa_list = []
+        phi_list = []
+        psi_list = []
 
+        # Backbone atom names in order
         backbone_atoms = ["N", "CA", "C", "O"]
 
-        for i, (res_id, res_name) in enumerate(zip(residue_ids, residue_names)):
-            # Convert 3-letter to 1-letter code
-            aa_1letter = AA_3_TO_1.get(res_name)
-            if aa_1letter is None:
-                # Skip non-standard amino acids
+        for key in dssp.keys():
+            residue_data = dssp[key]
+            aa = residue_data[1]  # One-letter amino acid code
+
+            # Skip non-standard amino acids (X)
+            if aa == "X":
                 continue
 
-            # Get atoms for this residue
-            res_mask = atoms.res_id == res_id
-            res_atoms = atoms[res_mask]
+            # Get the residue from the model to extract backbone coordinates
+            # DSSP key is (chain_id, res_id)
+            chain_id, res_id = key
+            try:
+                residue = model[chain_id][res_id]
+                # Check all backbone atoms are present
+                if not all(atom_name in residue for atom_name in backbone_atoms):
+                    continue
 
-            # Extract backbone atom coordinates
-            residue_coords = []
-            missing_atom = False
-
-            for atom_name in backbone_atoms:
-                atom_mask = res_atoms.atom_name == atom_name
-                if not np.any(atom_mask):
-                    missing_atom = True
-                    break
-                coord = res_atoms.coord[atom_mask][0]
-                residue_coords.append(
-                    [
+                # Extract coordinates for N, CA, C, O
+                residue_coords = []
+                for atom_name in backbone_atoms:
+                    coord = residue[atom_name].get_coord()
+                    residue_coords.append([
                         round(float(coord[0]), 1),
                         round(float(coord[1]), 1),
                         round(float(coord[2]), 1),
-                    ]
-                )
-
-            if missing_atom:
+                    ])
+                coords_backbone.append(residue_coords)
+            except KeyError:
+                # Residue not found, skip
                 continue
 
-            # Get SS for this residue
-            ss = SSE_TO_SS3.get(sse[i], "C")
-
-            sequence.append(aa_1letter)
-            coords_backbone.append(residue_coords)
-            ss3_list.append(ss)
+            sequence.append(aa)
+            ss8_list.append(residue_data[2])  # 8-state secondary structure
+            rsa_list.append(round(residue_data[3], 3))  # Relative solvent accessibility
+            phi_list.append(round(residue_data[4], 1))  # Phi angle
+            psi_list.append(round(residue_data[5], 1))  # Psi angle
 
         # Check minimum length
         if len(sequence) < 10:
             return None
 
+        # Convert 8-state to 3-state
+        ss3_list = [SS8_TO_SS3.get(ss, "C") for ss in ss8_list]
+
         # Build result
         seq_str = "".join(sequence)
+        ss8_str = "".join(ss8_list)
         ss3_str = "".join(ss3_list)
 
         # Extract ID from filename (e.g., AF-A0A009IHW8-F1-model_v4.cif.gz -> AF-A0A009IHW8-F1)
@@ -169,7 +165,11 @@ def process_cif_file(cif_path: Path) -> dict | None:
             "sequence": seq_str,
             "length": len(seq_str),
             "coords_backbone": coords_backbone,
+            "ss8": ss8_str,
             "ss3": ss3_str,
+            "rsa": rsa_list,
+            "phi": phi_list,
+            "psi": psi_list,
         }
 
     except Exception as e:

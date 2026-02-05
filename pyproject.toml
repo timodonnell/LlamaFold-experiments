@@ -14,6 +14,7 @@ dependencies = [
     "accelerate>=0.30",
     "scipy>=1.12",
     "biopython>=1.84",
+    "biotite>=1.6.0",
 ]
 
 [project.optional-dependencies]

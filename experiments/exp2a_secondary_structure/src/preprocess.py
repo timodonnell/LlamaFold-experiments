@@ -1,12 +1,13 @@
 """Preprocess AlphaFold DB CIF files to extract sequences, coordinates, and secondary structure.
 
-Converts .cif.gz files to JSONL format with sequence, backbone coordinates, secondary structure,
-and additional DSSP annotations. Uses DSSP for secondary structure assignment.
+Converts .cif.gz files to JSONL format with sequence, backbone coordinates, and
+secondary structure. Uses biotite for secondary structure annotation (no external
+binaries required).
 
-8-state to 3-state mapping:
-    H, G, I -> H (helix)
-    E, B -> E (strand)
-    T, S, C, - -> C (coil)
+Biotite's P-SEA algorithm annotates:
+    'a' -> H (alpha helix)
+    'b' -> E (beta strand)
+    'c' -> C (coil)
 
 Output fields per record:
     id: AlphaFold DB identifier
@@ -14,19 +15,7 @@ Output fields per record:
     length: sequence length
     coords_backbone: backbone atom coordinates as [[N_xyz, CA_xyz, C_xyz, O_xyz], ...]
                      where each is [x, y, z] in Angstroms (rounded to 1 decimal)
-    ss8: 8-state secondary structure (H, G, I, E, B, T, S, C, -)
     ss3: 3-state secondary structure (H, E, C)
-    rsa: relative solvent accessibility per residue
-    phi: phi dihedral angles per residue
-    psi: psi dihedral angles per residue
-    hbond_nh_o_1_relidx: H-bond NH->O (1st), relative residue index (0 = no bond)
-    hbond_nh_o_1_energy: H-bond NH->O (1st), energy in kcal/mol
-    hbond_o_nh_1_relidx: H-bond O->NH (1st), relative residue index
-    hbond_o_nh_1_energy: H-bond O->NH (1st), energy
-    hbond_nh_o_2_relidx: H-bond NH->O (2nd), relative residue index
-    hbond_nh_o_2_energy: H-bond NH->O (2nd), energy
-    hbond_o_nh_2_relidx: H-bond O->NH (2nd), relative residue index
-    hbond_o_nh_2_energy: H-bond O->NH (2nd), energy
 """
 
 from __future__ import annotations
@@ -36,146 +25,130 @@ import gzip
 import hashlib
 import json
 import sys
-import tempfile
 from multiprocessing import Pool
 from pathlib import Path
 
-from Bio.PDB import PDBIO, MMCIFParser
-from Bio.PDB.DSSP import DSSP
+import biotite.structure as struc
+import biotite.structure.io.pdbx as pdbx
+import numpy as np
 
-# 8-state to 3-state mapping
-SS8_TO_SS3 = {
-    "H": "H",  # Alpha helix
-    "G": "H",  # 3-10 helix
-    "I": "H",  # Pi helix
-    "E": "E",  # Extended strand
-    "B": "E",  # Beta bridge
-    "T": "C",  # Turn
-    "S": "C",  # Bend
-    "C": "C",  # Coil
-    "-": "C",  # Not assigned
-    " ": "C",  # Not assigned (space)
+# Biotite SSE to our 3-state mapping
+SSE_TO_SS3 = {
+    "a": "H",  # Alpha helix
+    "b": "E",  # Beta strand
+    "c": "C",  # Coil
+    "": "C",  # Not assigned (non-amino acid)
+}
+
+# Standard amino acid 3-letter to 1-letter mapping
+AA_3_TO_1 = {
+    "ALA": "A",
+    "ARG": "R",
+    "ASN": "N",
+    "ASP": "D",
+    "CYS": "C",
+    "GLU": "E",
+    "GLN": "Q",
+    "GLY": "G",
+    "HIS": "H",
+    "ILE": "I",
+    "LEU": "L",
+    "LYS": "K",
+    "MET": "M",
+    "PHE": "F",
+    "PRO": "P",
+    "SER": "S",
+    "THR": "T",
+    "TRP": "W",
+    "TYR": "Y",
+    "VAL": "V",
 }
 
 
 def process_cif_file(cif_path: Path) -> dict | None:
-    """Process a single CIF file and extract sequence, coordinates, and DSSP annotations.
+    """Process a single CIF file and extract sequence, coordinates, and SS.
 
     Args:
         cif_path: Path to the .cif.gz file.
 
     Returns:
-        Dictionary with coordinates and all DSSP annotations, or None if processing fails.
+        Dictionary with sequence, coordinates, and SS, or None if processing fails.
     """
     try:
-        # Parse CIF file
-        parser = MMCIFParser(QUIET=True)
-
-        # Handle both .cif.gz and .cif files
+        # Read CIF file
         if str(cif_path).endswith(".gz"):
             with gzip.open(cif_path, "rt") as f:
-                structure = parser.get_structure("protein", f)
+                cif_file = pdbx.CIFFile.read(f)
         else:
-            structure = parser.get_structure("protein", str(cif_path))
+            cif_file = pdbx.CIFFile.read(str(cif_path))
 
-        # Get the first model
-        model = structure[0]
+        # Get structure (first model)
+        atoms = pdbx.get_structure(cif_file, model=1)
 
-        # Save as temporary PDB for DSSP
-        with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as tmp_pdb:
-            io = PDBIO()
-            io.set_structure(structure)
-            io.save(tmp_pdb.name)
-            tmp_pdb_path = tmp_pdb.name
+        # Filter to peptide residues only
+        atoms = atoms[struc.filter_amino_acids(atoms)]
 
-        try:
-            # Run DSSP
-            dssp = DSSP(model, tmp_pdb_path, dssp="mkdssp")
-        finally:
-            # Clean up temp file
-            Path(tmp_pdb_path).unlink(missing_ok=True)
+        if len(atoms) == 0:
+            return None
 
-        # Extract all DSSP data and backbone coordinates
-        # DSSP returns: (dssp_index, aa, ss, rsa, phi, psi,
-        #                nh_o_1_relidx, nh_o_1_energy, o_nh_1_relidx, o_nh_1_energy,
-        #                nh_o_2_relidx, nh_o_2_energy, o_nh_2_relidx, o_nh_2_energy)
+        # Get residue information
+        residue_ids, residue_names = struc.get_residues(atoms)
+
+        # Compute secondary structure using biotite's P-SEA algorithm
+        sse = struc.annotate_sse(atoms)
+
+        # Extract backbone coordinates and build sequence
         sequence = []
-        coords_backbone = []  # [[N_xyz, CA_xyz, C_xyz, O_xyz], ...]
-        ss8_list = []
-        rsa_list = []
-        phi_list = []
-        psi_list = []
-        hbond_nh_o_1_relidx = []
-        hbond_nh_o_1_energy = []
-        hbond_o_nh_1_relidx = []
-        hbond_o_nh_1_energy = []
-        hbond_nh_o_2_relidx = []
-        hbond_nh_o_2_energy = []
-        hbond_o_nh_2_relidx = []
-        hbond_o_nh_2_energy = []
+        coords_backbone = []
+        ss3_list = []
 
-        # Backbone atom names in order
         backbone_atoms = ["N", "CA", "C", "O"]
 
-        for key in dssp.keys():
-            residue_data = dssp[key]
-            aa = residue_data[1]  # One-letter amino acid code
-
-            # Skip non-standard amino acids (X)
-            if aa == "X":
+        for i, (res_id, res_name) in enumerate(zip(residue_ids, residue_names)):
+            # Convert 3-letter to 1-letter code
+            aa_1letter = AA_3_TO_1.get(res_name)
+            if aa_1letter is None:
+                # Skip non-standard amino acids
                 continue
 
-            # Get the residue from the model to extract backbone coordinates
-            # DSSP key is (chain_id, res_id)
-            chain_id, res_id = key
-            try:
-                residue = model[chain_id][res_id]
-                # Check all backbone atoms are present
-                if not all(atom_name in residue for atom_name in backbone_atoms):
-                    continue
+            # Get atoms for this residue
+            res_mask = atoms.res_id == res_id
+            res_atoms = atoms[res_mask]
 
-                # Extract coordinates for N, CA, C, O
-                residue_coords = []
-                for atom_name in backbone_atoms:
-                    coord = residue[atom_name].get_coord()
-                    residue_coords.append(
-                        [
-                            round(float(coord[0]), 1),
-                            round(float(coord[1]), 1),
-                            round(float(coord[2]), 1),
-                        ]
-                    )
-                coords_backbone.append(residue_coords)
-            except KeyError:
-                # Residue not found, skip
+            # Extract backbone atom coordinates
+            residue_coords = []
+            missing_atom = False
+
+            for atom_name in backbone_atoms:
+                atom_mask = res_atoms.atom_name == atom_name
+                if not np.any(atom_mask):
+                    missing_atom = True
+                    break
+                coord = res_atoms.coord[atom_mask][0]
+                residue_coords.append(
+                    [
+                        round(float(coord[0]), 1),
+                        round(float(coord[1]), 1),
+                        round(float(coord[2]), 1),
+                    ]
+                )
+
+            if missing_atom:
                 continue
 
-            sequence.append(aa)
-            ss8_list.append(residue_data[2])  # 8-state secondary structure
-            rsa_list.append(round(residue_data[3], 3))  # Relative solvent accessibility
-            phi_list.append(round(residue_data[4], 1))  # Phi angle
-            psi_list.append(round(residue_data[5], 1))  # Psi angle
+            # Get SS for this residue
+            ss = SSE_TO_SS3.get(sse[i], "C")
 
-            # Hydrogen bond data (relidx are int, energy rounded to 1 decimal)
-            hbond_nh_o_1_relidx.append(residue_data[6])
-            hbond_nh_o_1_energy.append(round(residue_data[7], 1))
-            hbond_o_nh_1_relidx.append(residue_data[8])
-            hbond_o_nh_1_energy.append(round(residue_data[9], 1))
-            hbond_nh_o_2_relidx.append(residue_data[10])
-            hbond_nh_o_2_energy.append(round(residue_data[11], 1))
-            hbond_o_nh_2_relidx.append(residue_data[12])
-            hbond_o_nh_2_energy.append(round(residue_data[13], 1))
+            sequence.append(aa_1letter)
+            coords_backbone.append(residue_coords)
+            ss3_list.append(ss)
 
         # Check minimum length
         if len(sequence) < 10:
             return None
 
-        # Convert 8-state to 3-state
-        ss3_list = [SS8_TO_SS3.get(ss, "C") for ss in ss8_list]
-
         # Build result
         seq_str = "".join(sequence)
-        ss8_str = "".join(ss8_list)
         ss3_str = "".join(ss3_list)
 
         # Extract ID from filename (e.g., AF-A0A009IHW8-F1-model_v4.cif.gz -> AF-A0A009IHW8-F1)
@@ -196,19 +169,7 @@ def process_cif_file(cif_path: Path) -> dict | None:
             "sequence": seq_str,
             "length": len(seq_str),
             "coords_backbone": coords_backbone,
-            "ss8": ss8_str,
             "ss3": ss3_str,
-            "rsa": rsa_list,
-            "phi": phi_list,
-            "psi": psi_list,
-            "hbond_nh_o_1_relidx": hbond_nh_o_1_relidx,
-            "hbond_nh_o_1_energy": hbond_nh_o_1_energy,
-            "hbond_o_nh_1_relidx": hbond_o_nh_1_relidx,
-            "hbond_o_nh_1_energy": hbond_o_nh_1_energy,
-            "hbond_nh_o_2_relidx": hbond_nh_o_2_relidx,
-            "hbond_nh_o_2_energy": hbond_nh_o_2_energy,
-            "hbond_o_nh_2_relidx": hbond_o_nh_2_relidx,
-            "hbond_o_nh_2_energy": hbond_o_nh_2_energy,
         }
 
     except Exception as e:

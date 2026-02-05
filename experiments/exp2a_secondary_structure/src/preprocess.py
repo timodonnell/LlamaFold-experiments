@@ -74,11 +74,21 @@ def process_cif_file(cif_path: Path) -> dict | None:
         model = structure[0]
 
         # Save as temporary PDB for DSSP
-        with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as tmp_pdb:
-            io = PDBIO()
-            io.set_structure(structure)
-            io.save(tmp_pdb.name)
+        # DSSP requires a CRYST1 record, so we write the PDB and prepend one
+        with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False, mode="w") as tmp_pdb:
             tmp_pdb_path = tmp_pdb.name
+
+        io = PDBIO()
+        io.set_structure(structure)
+        io.save(tmp_pdb_path)
+
+        # Prepend CRYST1 record (dummy unit cell) since DSSP requires it
+        with open(tmp_pdb_path) as f:
+            pdb_content = f.read()
+        with open(tmp_pdb_path, "w") as f:
+            # Dummy CRYST1: 1x1x1 Angstrom cell, P1 space group
+            f.write("CRYST1    1.000    1.000    1.000  90.00  90.00  90.00 P 1           1\n")
+            f.write(pdb_content)
 
         try:
             # Run DSSP

@@ -44,6 +44,8 @@ experiments/
 ├── exp1_distance_matrix/         # ~20M param model, 501 distance tokens (<d0>-<d500>)
 ├── exp1b_distance_matrix_1b/     # ~1.2B param model, same tokenization as exp1
 ├── exp1c_distance_matrix_decimal/ # ~1B param model, decimal tokenization (26 distance tokens)
+├── exp1d_distance_matrix_addition/ # ~1B param model, decimal tokenization + 10% addition problems
+├── exp2a_secondary_structure/    # ~1B param model, 3-state SS prediction (H/E/C) from CA coordinates
 ├── exp2_residue_infilling/       # Predict missing residue coordinates (not yet implemented)
 ├── exp3_structure_prediction/    # Full structure from sequence + constraints (not yet implemented)
 shared/                           # Shared utilities across experiments

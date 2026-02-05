@@ -13,6 +13,7 @@ dependencies = [
     "transformers>=4.40",
     "accelerate>=0.30",
     "scipy>=1.12",
+    "biopython>=1.84",
 ]
 
 [project.optional-dependencies]

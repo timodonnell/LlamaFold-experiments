@@ -18,7 +18,6 @@ Coordinates are backbone atom positions binned to nearest Angstrom.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
 
 from torch.utils.data import Dataset
@@ -218,10 +217,48 @@ def format_prompt(sequence: str, coords_backbone: list[list[list[float]]]) -> st
     return "\n".join(lines)
 
 
+def _build_line_index(jsonl_path: str, max_length: int | None = None) -> list[int]:
+    """Build an index of byte offsets for valid lines in a JSONL file.
+
+    Only stores byte offsets, not the actual records, to avoid loading
+    the entire dataset into memory.
+
+    Args:
+        jsonl_path: Path to the JSONL file.
+        max_length: Optional maximum sequence length to include.
+
+    Returns:
+        List of byte offsets for each valid record.
+    """
+    offsets = []
+    with open(jsonl_path, "rb") as f:
+        while True:
+            offset = f.tell()
+            line = f.readline()
+            if not line:
+                break
+            if max_length is not None:
+                # Quick check without full JSON parse - look for "length": N
+                record = json.loads(line)
+                if record["length"] > max_length:
+                    continue
+            offsets.append(offset)
+    return offsets
+
+
+def _read_record(jsonl_path: str, offset: int) -> dict[str, Any]:
+    """Read a single record from a JSONL file at the given byte offset."""
+    with open(jsonl_path, "rb") as f:
+        f.seek(offset)
+        line = f.readline()
+        return json.loads(line)
+
+
 class SSDataset(Dataset):
     """Training dataset for secondary structure prediction from coordinates.
 
-    Loads all records from a JSONL file into memory.
+    Uses a line-offset index to avoid loading the entire JSONL file into memory.
+    Records are read from disk on demand.
     """
 
     def __init__(self, jsonl_path: str, max_length: int | None = None):
@@ -231,21 +268,14 @@ class SSDataset(Dataset):
             jsonl_path: Path to JSONL file with sequence/coords/ss3 records.
             max_length: Optional maximum sequence length to include.
         """
-        self.records: list[dict[str, Any]] = []
-
-        path = Path(jsonl_path)
-        with open(path) as f:
-            for line in f:
-                record = json.loads(line.strip())
-                if max_length is not None and record["length"] > max_length:
-                    continue
-                self.records.append(record)
+        self.jsonl_path = jsonl_path
+        self.offsets = _build_line_index(jsonl_path, max_length)
 
     def __len__(self) -> int:
-        return len(self.records)
+        return len(self.offsets)
 
     def __getitem__(self, idx: int) -> dict[str, str]:
-        record = self.records[idx]
+        record = _read_record(self.jsonl_path, self.offsets[idx])
         text = format_document(record["sequence"], record["coords_backbone"], record["ss3"])
         return {"text": text}
 
@@ -254,6 +284,7 @@ class SSEvalDataset(Dataset):
     """Evaluation dataset for secondary structure prediction.
 
     Returns prompts and ground truth for generative evaluation.
+    Uses a line-offset index to avoid loading the entire JSONL file into memory.
     """
 
     def __init__(self, jsonl_path: str, max_length: int | None = None):
@@ -263,21 +294,14 @@ class SSEvalDataset(Dataset):
             jsonl_path: Path to JSONL file with sequence/coords/ss3 records.
             max_length: Optional maximum sequence length to include.
         """
-        self.records: list[dict[str, Any]] = []
-
-        path = Path(jsonl_path)
-        with open(path) as f:
-            for line in f:
-                record = json.loads(line.strip())
-                if max_length is not None and record["length"] > max_length:
-                    continue
-                self.records.append(record)
+        self.jsonl_path = jsonl_path
+        self.offsets = _build_line_index(jsonl_path, max_length)
 
     def __len__(self) -> int:
-        return len(self.records)
+        return len(self.offsets)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        record = self.records[idx]
+        record = _read_record(self.jsonl_path, self.offsets[idx])
         prompt = format_prompt(record["sequence"], record["coords_backbone"])
         true_ss = list(record["ss3"])
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from collections import Counter
@@ -37,6 +38,12 @@ from .data import SSDataset, SSEvalDataset, get_special_tokens
 
 if TYPE_CHECKING:
     from transformers import PreTrainedModel, PreTrainedTokenizer
+
+
+def _is_main_process() -> bool:
+    """Check if this is the main process in distributed training."""
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    return local_rank in (-1, 0)
 
 
 def create_tokenizer() -> PreTrainedTokenizerFast:
@@ -355,11 +362,17 @@ class ExampleLoggingCallback(TrainerCallback):
             self._running = False
 
     def _do_evaluate(self, args, state, control, model, **kwargs):
-        device = next(model.parameters()).device
+        # Only run on main process
+        if not _is_main_process():
+            return
+
+        # Unwrap DDP if needed
+        raw_model = model.module if hasattr(model, "module") else model
+        device = next(raw_model.parameters()).device
 
         # Run evaluation with examples
         eval_results = evaluate_model(
-            model=model,
+            model=raw_model,
             tokenizer=self.tokenizer,
             eval_dataset=self.eval_dataset,
             device=device,
@@ -476,52 +489,56 @@ def train(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
+    is_main = _is_main_process()
+
     # Set seed
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    print("Setting up tokenizer and model...")
+    if is_main:
+        print("Setting up tokenizer and model...")
     tokenizer = create_tokenizer()
     model = create_model(vocab_size=len(tokenizer))
 
-    # Move model to GPU if available
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
+    # Don't manually move to device — Trainer handles this for DDP
 
     # Log model summary
     n_params = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     model_config = model.config
 
-    print("\n" + "=" * 60)
-    print("MODEL SUMMARY")
-    print("=" * 60)
-    print(f"  Total parameters:     {n_params:,}")
-    print(f"  Trainable parameters: {n_trainable:,}")
-    print(f"  Vocabulary size:      {len(tokenizer)}")
-    print(f"  Hidden size:          {model_config.hidden_size}")
-    print(f"  Intermediate size:    {model_config.intermediate_size}")
-    print(f"  Num layers:           {model_config.num_hidden_layers}")
-    print(f"  Num attention heads:  {model_config.num_attention_heads}")
-    print(f"  Num KV heads:         {model_config.num_key_value_heads}")
-    print(f"  Max sequence length:  {model_config.max_position_embeddings}")
-    print(f"  Device:               {device}")
-    print("=" * 60 + "\n")
+    if is_main:
+        print("\n" + "=" * 60)
+        print("MODEL SUMMARY")
+        print("=" * 60)
+        print(f"  Total parameters:     {n_params:,}")
+        print(f"  Trainable parameters: {n_trainable:,}")
+        print(f"  Vocabulary size:      {len(tokenizer)}")
+        print(f"  Hidden size:          {model_config.hidden_size}")
+        print(f"  Intermediate size:    {model_config.intermediate_size}")
+        print(f"  Num layers:           {model_config.num_hidden_layers}")
+        print(f"  Num attention heads:  {model_config.num_attention_heads}")
+        print(f"  Num KV heads:         {model_config.num_key_value_heads}")
+        print(f"  Max sequence length:  {model_config.max_position_embeddings}")
+        print("=" * 60 + "\n")
 
-    print("Loading datasets...")
+    if is_main:
+        print("Loading datasets...")
     # Load datasets
     train_dataset = SSDataset(train_data, max_length=max_seq_length)
     val_dataset = SSDataset(val_data, max_length=max_seq_length)
     eval_dataset = SSEvalDataset(test_data, max_length=max_seq_length)
 
-    print(f"  Train: {len(train_dataset)} sequences")
-    print(f"  Val:   {len(val_dataset)} sequences")
-    print(f"  Test:  {len(eval_dataset)} sequences")
+    if is_main:
+        print(f"  Train: {len(train_dataset)} sequences")
+        print(f"  Val:   {len(val_dataset)} sequences")
+        print(f"  Test:  {len(eval_dataset)} sequences")
 
     # Limit training samples if specified
     if train_samples is not None and train_samples < len(train_dataset):
         train_dataset.offsets = train_dataset.offsets[:train_samples]
-        print(f"  Limited train to: {len(train_dataset)} sequences")
+        if is_main:
+            print(f"  Limited train to: {len(train_dataset)} sequences")
 
     # Wrap with tokenization
     # Token budget: ~14N tokens for N residues:
@@ -599,8 +616,8 @@ def train(
         seed=seed,
     )
 
-    # Initialize wandb
-    if use_wandb:
+    # Initialize wandb (main process only)
+    if use_wandb and is_main:
         wandb.init(
             project=wandb_project,
             name=wandb_run_name,
@@ -630,50 +647,55 @@ def train(
     )
 
     # Train
-    print("Starting training...")
+    if is_main:
+        print("Starting training...")
     train_result = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
-    # Save model
+    # Save model (Trainer handles main-process-only saving)
     trainer.save_model(str(output_path / "final_model"))
-    tokenizer.save_pretrained(str(output_path / "final_model"))
+    if is_main:
+        tokenizer.save_pretrained(str(output_path / "final_model"))
 
-    # Final evaluation
-    print("Evaluating model on test set...")
-    device = next(model.parameters()).device
-    eval_results = evaluate_model(
-        model=model,
-        tokenizer=tokenizer,
-        eval_dataset=eval_dataset,
-        device=device,
-        n_examples=len(eval_dataset),
-        log_examples=log_examples,
-    )
+    # Final evaluation (main process only)
+    eval_results = None
+    if is_main:
+        print("Evaluating model on test set...")
+        raw_model = model.module if hasattr(model, "module") else model
+        device = next(raw_model.parameters()).device
+        eval_results = evaluate_model(
+            model=raw_model,
+            tokenizer=tokenizer,
+            eval_dataset=eval_dataset,
+            device=device,
+            n_examples=len(eval_dataset),
+            log_examples=log_examples,
+        )
 
-    print("\nFinal Evaluation Results:")
-    print(f"  Q3 Accuracy: {eval_results['q3_accuracy']:.2f}%")
-    print(f"  Class H: {eval_results['class_accuracy_H']:.2f}%")
-    print(f"  Class E: {eval_results['class_accuracy_E']:.2f}%")
-    print(f"  Class C: {eval_results['class_accuracy_C']:.2f}%")
-    print(f"  % valid syntax: {eval_results['pct_valid_syntax']:.1f}%")
-    print(f"  % length match: {eval_results['pct_length_match']:.1f}%")
-    print(f"  Total residues evaluated: {eval_results['total_residues']}")
+        print("\nFinal Evaluation Results:")
+        print(f"  Q3 Accuracy: {eval_results['q3_accuracy']:.2f}%")
+        print(f"  Class H: {eval_results['class_accuracy_H']:.2f}%")
+        print(f"  Class E: {eval_results['class_accuracy_E']:.2f}%")
+        print(f"  Class C: {eval_results['class_accuracy_C']:.2f}%")
+        print(f"  % valid syntax: {eval_results['pct_valid_syntax']:.1f}%")
+        print(f"  % length match: {eval_results['pct_length_match']:.1f}%")
+        print(f"  Total residues evaluated: {eval_results['total_residues']}")
 
-    # Log examples to terminal
-    print(f"\n{'=' * 80}")
-    print("LOGGED EXAMPLES")
-    print("=" * 80)
-    for i, example in enumerate(eval_results["logged_examples"]):
-        print(f"\n--- Example {i + 1} ---")
-        print(f"ID: {example['id']}")
-        print(f"Sequence: {example['sequence']}")
-        print(f"True SS:  {example['true_ss']}")
-        print(f"Pred SS:  {example['pred_ss']}")
-        print(f"Length: {example['length']}, Pred length: {example['pred_length']}")
-        print(f"Valid: {example['is_valid']}, Length match: {example['length_matches']}")
-        print("-" * 40)
+        # Log examples to terminal
+        print(f"\n{'=' * 80}")
+        print("LOGGED EXAMPLES")
+        print("=" * 80)
+        for i, example in enumerate(eval_results["logged_examples"]):
+            print(f"\n--- Example {i + 1} ---")
+            print(f"ID: {example['id']}")
+            print(f"Sequence: {example['sequence']}")
+            print(f"True SS:  {example['true_ss']}")
+            print(f"Pred SS:  {example['pred_ss']}")
+            print(f"Length: {example['length']}, Pred length: {example['pred_length']}")
+            print(f"Valid: {example['is_valid']}, Length match: {example['length_matches']}")
+            print("-" * 40)
 
-    # Log to wandb
-    if use_wandb:
+    # Log to wandb (main process only)
+    if use_wandb and is_main and eval_results is not None:
         wandb.log(
             {
                 "eval/q3_accuracy": eval_results["q3_accuracy"],
@@ -721,20 +743,21 @@ def train(
             wandb.run.summary["eval_pct_length_match"] = eval_results["pct_length_match"]
         wandb.finish()
 
-    # Save results
-    results = {
-        "config": config,
-        "train_loss": train_result.training_loss,
-        "eval_q3_accuracy": eval_results["q3_accuracy"],
-        "eval_class_accuracy_H": eval_results["class_accuracy_H"],
-        "eval_class_accuracy_E": eval_results["class_accuracy_E"],
-        "eval_class_accuracy_C": eval_results["class_accuracy_C"],
-        "eval_pct_valid_syntax": eval_results["pct_valid_syntax"],
-        "eval_pct_length_match": eval_results["pct_length_match"],
-    }
-
-    with open(output_path / "results.json", "w") as f:
-        json.dump(results, f, indent=2)
+    # Save results (main process only)
+    results = {"config": config, "train_loss": train_result.training_loss}
+    if is_main and eval_results is not None:
+        results.update(
+            {
+                "eval_q3_accuracy": eval_results["q3_accuracy"],
+                "eval_class_accuracy_H": eval_results["class_accuracy_H"],
+                "eval_class_accuracy_E": eval_results["class_accuracy_E"],
+                "eval_class_accuracy_C": eval_results["class_accuracy_C"],
+                "eval_pct_valid_syntax": eval_results["pct_valid_syntax"],
+                "eval_pct_length_match": eval_results["pct_length_match"],
+            }
+        )
+        with open(output_path / "results.json", "w") as f:
+            json.dump(results, f, indent=2)
 
     return results
 

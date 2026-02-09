@@ -18,6 +18,7 @@ Coordinates are backbone atom positions binned to nearest Angstrom.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from torch.utils.data import Dataset
@@ -230,6 +231,7 @@ def _build_line_index(jsonl_path: str, max_length: int | None = None) -> list[in
     Returns:
         List of byte offsets for each valid record.
     """
+    length_pattern = re.compile(rb'"length":\s*(\d+)')
     offsets = []
     with open(jsonl_path, "rb") as f:
         while True:
@@ -238,9 +240,9 @@ def _build_line_index(jsonl_path: str, max_length: int | None = None) -> list[in
             if not line:
                 break
             if max_length is not None:
-                # Quick check without full JSON parse - look for "length": N
-                record = json.loads(line)
-                if record["length"] > max_length:
+                # Extract length via regex to avoid full JSON parse of large records
+                match = length_pattern.search(line)
+                if match and int(match.group(1)) > max_length:
                     continue
             offsets.append(offset)
     return offsets

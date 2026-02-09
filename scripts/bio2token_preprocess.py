@@ -2,23 +2,22 @@
 """Preprocess protein structures into bio2token FSQ indices for exp3.
 
 This script runs in bio2token's Python 3.11 environment (NOT our project's env).
-It reads existing exp2a JSONL data for metadata (id, sequence, ss3), finds
-corresponding CIF files, encodes all-atom coordinates with bio2token's pretrained
-prot2token encoder, extracts backbone atom (N, CA, C, O) token indices, and
-writes new JSONL files to data/exp3/.
+It reads existing exp2a JSONL data for metadata (id, sequence, ss3), finds the
+corresponding CIF file, converts it to PDB, and feeds all atoms through bio2token's
+pretrained prot2token FSQ autoencoder. The resulting per-atom discrete tokens for
+backbone atoms (N, CA, C, O) are extracted and written to new JSONL files.
 
 Requirements:
     - bio2token repo cloned and set up with `uv sync`
-    - Pretrained checkpoint at checkpoints/prot2token_pretrained/last.ckpt
-    - CIF files for the proteins in the exp2a data
+    - Pretrained checkpoint (auto-detected in checkpoints/ dir)
+    - CIF files directory (AlphaFold DB structures)
 
 Usage (from the bio2token repo directory):
-    uv run python /path/to/bio2token_preprocess.py \
+    .venv/bin/python /path/to/bio2token_preprocess.py \
         --exp2a-dir /path/to/data/exp2a \
         --cif-dir /path/to/cif_files \
         --output-dir /path/to/data/exp3 \
-        --bio2token-dir . \
-        --checkpoint checkpoints/prot2token_pretrained/last.ckpt
+        --bio2token-dir .
 """
 
 from __future__ import annotations
@@ -26,10 +25,12 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import torch
 from Bio.PDB import PDBIO, MMCIFParser
 
@@ -51,9 +52,11 @@ def load_bio2token_model(bio2token_dir: str, checkpoint_path: str, device: torch
     from bio2token.models.autoencoder import Autoencoder, AutoencoderConfig
     from bio2token.utils.configs import pi_instantiate, utilsyaml_to_dict
 
-    # Load config
-    config_path = str(Path(bio2token_dir) / "configs" / "test_pdb.yaml")
-    global_configs = utilsyaml_to_dict(config_path)
+    # Load config (utilsyaml_to_dict prepends "configs/" relative to CWD)
+    old_cwd = os.getcwd()
+    os.chdir(bio2token_dir)
+    global_configs = utilsyaml_to_dict("test_pdb.yaml")
+    os.chdir(old_cwd)
 
     # Instantiate model
     model_config = pi_instantiate(AutoencoderConfig, yaml_dict=global_configs["model"])
@@ -68,46 +71,99 @@ def load_bio2token_model(bio2token_dir: str, checkpoint_path: str, device: torch
     return model
 
 
-def cif_to_pdb_dict(cif_path: Path) -> dict | None:
-    """Parse a CIF file and extract all-atom info in bio2token's expected format.
+def find_checkpoint(bio2token_dir: str) -> str:
+    """Auto-detect the prot2token pretrained checkpoint.
+
+    Args:
+        bio2token_dir: Path to the bio2token repo root.
+
+    Returns:
+        Path to the checkpoint file.
+
+    Raises:
+        FileNotFoundError: If no checkpoint is found.
+    """
+    ckpt_dir = Path(bio2token_dir) / "checkpoints" / "bio2token" / "prot2token_pretrained"
+    if ckpt_dir.is_dir():
+        ckpts = list(ckpt_dir.glob("*.ckpt"))
+        if ckpts:
+            return str(ckpts[0])
+
+    # Fallback: try legacy path
+    legacy = Path(bio2token_dir) / "checkpoints" / "prot2token_pretrained" / "last.ckpt"
+    if legacy.exists():
+        return str(legacy)
+
+    raise FileNotFoundError(
+        f"No prot2token checkpoint found in {ckpt_dir} or {legacy.parent}"
+    )
+
+
+def find_cif_file(protein_id: str, cif_dir: Path) -> Path | None:
+    """Find the CIF file for a given protein ID.
+
+    Args:
+        protein_id: Protein identifier (e.g., "AF-A0A009IHW8-F1").
+        cif_dir: Directory containing CIF files.
+
+    Returns:
+        Path to the CIF file, or None if not found.
+    """
+    for version in ("v6", "v4", "v3"):
+        for ext in (".cif.gz", ".cif"):
+            path = cif_dir / f"{protein_id}-model_{version}{ext}"
+            if path.exists():
+                return path
+
+    # Try without version suffix
+    for ext in (".cif.gz", ".cif"):
+        path = cif_dir / f"{protein_id}{ext}"
+        if path.exists():
+            return path
+
+    return None
+
+
+def cif_to_temp_pdb(cif_path: Path) -> str | None:
+    """Convert a CIF file to a temporary PDB file.
 
     Args:
         cif_path: Path to .cif or .cif.gz file.
 
     Returns:
-        Dictionary with keys: seq, res_types, coords_groundtruth, atom_names,
-        res_atom_start, res_atom_end. Or None if parsing fails.
+        Path to temporary PDB file, or None on failure.
     """
     try:
         parser = MMCIFParser(QUIET=True)
-
         if str(cif_path).endswith(".gz"):
             with gzip.open(cif_path, "rt") as f:
                 structure = parser.get_structure("protein", f)
         else:
             structure = parser.get_structure("protein", str(cif_path))
 
-        # Write to temp PDB for bio2token's pdb_2_dict
-        with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False, mode="w") as tmp:
+        with tempfile.NamedTemporaryFile(
+            suffix=".pdb", delete=False, mode="w"
+        ) as tmp:
             tmp_path = tmp.name
 
         io = PDBIO()
         io.set_structure(structure)
         io.save(tmp_path)
-
         return tmp_path
-
     except Exception as e:
-        print(f"Error parsing {cif_path}: {e}", file=sys.stderr)
+        print(f"Error converting {cif_path}: {e}", file=sys.stderr)
         return None
 
 
-def encode_structure(
+def encode_all_atom(
     model,
     pdb_path: str,
     device: torch.device,
 ) -> list[list[int]] | None:
-    """Encode a protein structure into per-residue backbone bio2token indices.
+    """Encode all-atom structure and extract backbone bio2token indices.
+
+    Uses bio2token's native pdb_2_dict + uniform_dataframe pipeline to get
+    all-atom input, then extracts backbone (N, CA, C, O) token indices.
 
     Args:
         model: Loaded bio2token Autoencoder.
@@ -115,30 +171,42 @@ def encode_structure(
         device: Device for inference.
 
     Returns:
-        List of [N_tok, CA_tok, C_tok, O_tok] per residue (values in 0-4095),
+        List of [N_tok, CA_tok, C_tok, O_tok] per residue (values 0-4095),
         or None on failure.
     """
     from bio2token.data.utils.utils import compute_masks, pdb_2_dict, uniform_dataframe
 
+    # Suppress bio2token's print statements
+    old_stdout = sys.stdout
+    sys.stdout = open(os.devnull, "w")
     try:
         pdb_dict = pdb_2_dict(pdb_path)
     except Exception as e:
-        print(f"Error reading PDB {pdb_path}: {e}", file=sys.stderr)
+        sys.stdout = old_stdout
+        print(f"Error in pdb_2_dict: {e}", file=sys.stderr)
         return None
+    finally:
+        sys.stdout.close()
+        sys.stdout = old_stdout
 
     try:
-        structure, unknown_structure, residue_name, residue_ids, token_class, atom_names = (
-            uniform_dataframe(
-                pdb_dict["seq"],
-                pdb_dict["res_types"],
-                pdb_dict["coords_groundtruth"],
-                pdb_dict["atom_names"],
-                pdb_dict["res_atom_start"],
-                pdb_dict["res_atom_end"],
-            )
+        (
+            structure,
+            unknown_structure,
+            residue_name,
+            residue_ids,
+            token_class,
+            atom_names,
+        ) = uniform_dataframe(
+            pdb_dict["seq"],
+            pdb_dict["res_types"],
+            pdb_dict["coords_groundtruth"],
+            pdb_dict["atom_names"],
+            pdb_dict["res_atom_start"],
+            pdb_dict["res_atom_end"],
         )
     except Exception as e:
-        print(f"Error in uniform_dataframe for {pdb_path}: {e}", file=sys.stderr)
+        print(f"Error in uniform_dataframe: {e}", file=sys.stderr)
         return None
 
     # Build batch
@@ -173,63 +241,29 @@ def encode_structure(
     pad_mask = batch["eos_pad_mask"][0].cpu()
 
     # Remove padding
-    valid = pad_mask == 0
+    valid = ~pad_mask
     all_indices = all_indices[valid]
     all_token_class = all_token_class[valid]
     all_residue_ids = all_residue_ids[valid]
 
     # Extract backbone atoms only (token_class 0=BB(N,C,O), 1=CA_ref)
-    # Within each residue, bio2token orders atoms as: N, CA, C, O, then sidechains
-    # So backbone atoms are the first 4 per residue with token_class 0 or 1
     backbone_mask = (all_token_class == 0) | (all_token_class == 1)
     bb_indices = all_indices[backbone_mask]
     bb_residue_ids = all_residue_ids[backbone_mask]
 
-    # Group by residue: expect exactly 4 backbone atoms per residue (N, CA, C, O)
+    # Group by residue: expect exactly 4 backbone atoms (N, CA, C, O)
     unique_residues = bb_residue_ids.unique(sorted=True)
     result = []
     for res_id in unique_residues:
         res_mask = bb_residue_ids == res_id
         res_indices = bb_indices[res_mask].tolist()
         if len(res_indices) != 4:
-            # Skip residues without exactly 4 backbone atoms
             continue
-        # Verify all indices are in valid range
         if any(idx < 0 or idx >= 4096 for idx in res_indices):
             continue
         result.append(res_indices)
 
     return result if result else None
-
-
-def find_cif_file(protein_id: str, cif_dir: Path) -> Path | None:
-    """Find the CIF file for a given protein ID.
-
-    Tries common naming patterns for AlphaFold DB files.
-
-    Args:
-        protein_id: Protein identifier (e.g., "AF-A0A009IHW8-F1").
-        cif_dir: Directory containing CIF files.
-
-    Returns:
-        Path to the CIF file, or None if not found.
-    """
-    # Try common patterns
-    patterns = [
-        f"{protein_id}-model_v4.cif.gz",
-        f"{protein_id}-model_v4.cif",
-        f"{protein_id}-model_v3.cif.gz",
-        f"{protein_id}-model_v3.cif",
-        f"{protein_id}.cif.gz",
-        f"{protein_id}.cif",
-    ]
-
-    for pattern in patterns:
-        path = cif_dir / pattern
-        if path.exists():
-            return path
-
-    return None
 
 
 def process_split(
@@ -253,10 +287,17 @@ def process_split(
     Returns:
         Dictionary with processing statistics.
     """
-    stats = {"total": 0, "success": 0, "no_cif": 0, "encode_fail": 0, "length_mismatch": 0}
+    stats = {
+        "total": 0,
+        "success": 0,
+        "no_cif": 0,
+        "convert_fail": 0,
+        "encode_fail": 0,
+        "length_mismatch": 0,
+    }
 
     with open(exp2a_path) as fin, open(output_path, "w") as fout:
-        for line_num, line in enumerate(fin):
+        for line in fin:
             record = json.loads(line)
             stats["total"] += 1
 
@@ -267,29 +308,34 @@ def process_split(
             if cif_path is None:
                 stats["no_cif"] += 1
                 if stats["no_cif"] <= 5:
-                    print(f"  Warning: no CIF file for {protein_id}", file=sys.stderr)
+                    print(
+                        f"  Warning: no CIF for {protein_id}",
+                        file=sys.stderr,
+                    )
                 continue
 
             # Convert CIF to temp PDB
-            tmp_pdb_path = cif_to_pdb_dict(cif_path)
+            tmp_pdb_path = cif_to_temp_pdb(cif_path)
             if tmp_pdb_path is None:
-                stats["encode_fail"] += 1
+                stats["convert_fail"] += 1
                 continue
 
             try:
-                # Encode with bio2token
-                bio2token_indices = encode_structure(model, tmp_pdb_path, device)
+                # Encode all-atom structure with bio2token
+                bio2token_indices = encode_all_atom(model, tmp_pdb_path, device)
             finally:
-                # Clean up temp PDB
                 Path(tmp_pdb_path).unlink(missing_ok=True)
 
             if bio2token_indices is None:
                 stats["encode_fail"] += 1
+                if stats["encode_fail"] <= 5:
+                    print(
+                        f"  Warning: encode failed for {protein_id}",
+                        file=sys.stderr,
+                    )
                 continue
 
-            # Verify length matches the sequence
-            # Note: bio2token may drop residues with missing atoms, so we need to
-            # check if the number of residues with 4 backbone tokens matches
+            # Verify length matches sequence
             seq_len = len(record["sequence"])
             if len(bio2token_indices) != seq_len:
                 stats["length_mismatch"] += 1
@@ -313,13 +359,10 @@ def process_split(
             stats["success"] += 1
 
             # Progress
-            if (stats["total"]) % 100 == 0:
+            if stats["total"] % 1000 == 0:
                 print(
                     f"  [{split_name}] {stats['total']} processed, "
-                    f"{stats['success']} success, "
-                    f"{stats['no_cif']} no CIF, "
-                    f"{stats['encode_fail']} encode fail, "
-                    f"{stats['length_mismatch']} length mismatch"
+                    f"{stats['success']} success"
                 )
 
     return stats
@@ -327,13 +370,13 @@ def process_split(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Preprocess protein structures into bio2token FSQ indices"
+        description="Preprocess CIF structures into bio2token FSQ indices"
     )
     parser.add_argument(
         "--exp2a-dir",
         type=str,
         required=True,
-        help="Directory containing exp2a JSONL files (train.jsonl, val.jsonl, test.jsonl)",
+        help="Directory with exp2a JSONL files (train/val/test.jsonl)",
     )
     parser.add_argument(
         "--cif-dir",
@@ -357,8 +400,7 @@ def main():
         "--checkpoint",
         type=str,
         default=None,
-        help="Path to pretrained checkpoint "
-        "(default: <bio2token-dir>/checkpoints/prot2token_pretrained/last.ckpt)",
+        help="Path to pretrained checkpoint (auto-detected if not set)",
     )
     parser.add_argument(
         "--splits",
@@ -383,13 +425,12 @@ def main():
 
     checkpoint = args.checkpoint
     if checkpoint is None:
-        checkpoint = str(
-            Path(args.bio2token_dir) / "checkpoints" / "prot2token_pretrained" / "last.ckpt"
-        )
+        checkpoint = find_checkpoint(args.bio2token_dir)
+    print(f"Using checkpoint: {checkpoint}")
 
     device = torch.device(args.device)
 
-    print(f"Loading bio2token model from {checkpoint}...")
+    print("Loading bio2token model...")
     model = load_bio2token_model(args.bio2token_dir, checkpoint, device)
     print("Model loaded.")
 
@@ -402,13 +443,15 @@ def main():
 
         output_path = output_dir / f"{split}.jsonl"
         print(f"\nProcessing {split}...")
-        stats = process_split(split, exp2a_path, cif_dir, output_path, model, device)
+        stats = process_split(
+            split, exp2a_path, cif_dir, output_path, model, device
+        )
         all_stats[split] = stats
 
         print(f"  {split} done: {stats['success']}/{stats['total']} success")
-        print(f"    no CIF: {stats['no_cif']}")
-        print(f"    encode fail: {stats['encode_fail']}")
-        print(f"    length mismatch: {stats['length_mismatch']}")
+        for key in ("no_cif", "convert_fail", "encode_fail", "length_mismatch"):
+            if stats[key] > 0:
+                print(f"    {key}: {stats[key]}")
 
     # Summary
     print("\n" + "=" * 60)

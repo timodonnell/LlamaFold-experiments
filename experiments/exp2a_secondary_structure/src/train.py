@@ -443,6 +443,29 @@ class ExampleLoggingCallback(TrainerCallback):
             wandb.log({f"eval_examples/examples_step_{state.global_step}": example_table})
 
 
+class SSDataCollator:
+    """Data collator that pads input_ids, attention_mask, and custom labels."""
+
+    def __init__(self, pad_token_id: int):
+        self.pad_token_id = pad_token_id
+
+    def __call__(self, features: list[dict]) -> dict:
+        max_len = max(len(f["input_ids"]) for f in features)
+        input_ids = []
+        attention_mask = []
+        labels = []
+        for f in features:
+            pad_len = max_len - len(f["input_ids"])
+            input_ids.append(f["input_ids"] + [self.pad_token_id] * pad_len)
+            attention_mask.append(f["attention_mask"] + [0] * pad_len)
+            labels.append(f["labels"] + [-100] * pad_len)
+        return {
+            "input_ids": torch.tensor(input_ids),
+            "attention_mask": torch.tensor(attention_mask),
+            "labels": torch.tensor(labels),
+        }
+
+
 def train(
     train_data: str,
     val_data: str,
@@ -572,23 +595,7 @@ def train(
     }
 
     # Data collator that pads and preserves our custom labels
-    pad_token_id = tokenizer.pad_token_id
-
-    def data_collator(features: list[dict]) -> dict:
-        max_len = max(len(f["input_ids"]) for f in features)
-        input_ids = []
-        attention_mask = []
-        labels = []
-        for f in features:
-            pad_len = max_len - len(f["input_ids"])
-            input_ids.append(f["input_ids"] + [pad_token_id] * pad_len)
-            attention_mask.append(f["attention_mask"] + [0] * pad_len)
-            labels.append(f["labels"] + [-100] * pad_len)
-        return {
-            "input_ids": torch.tensor(input_ids),
-            "attention_mask": torch.tensor(attention_mask),
-            "labels": torch.tensor(labels),
-        }
+    data_collator = SSDataCollator(pad_token_id=tokenizer.pad_token_id)
 
     # Training arguments
     training_args = TrainingArguments(

@@ -129,11 +129,13 @@ def process_cif_file(cif_path: Path) -> dict | None:
                 residue_coords = []
                 for atom_name in backbone_atoms:
                     coord = residue[atom_name].get_coord()
-                    residue_coords.append([
-                        round(float(coord[0]), 1),
-                        round(float(coord[1]), 1),
-                        round(float(coord[2]), 1),
-                    ])
+                    residue_coords.append(
+                        [
+                            round(float(coord[0]), 1),
+                            round(float(coord[1]), 1),
+                            round(float(coord[2]), 1),
+                        ]
+                    )
                 coords_backbone.append(residue_coords)
             except KeyError:
                 # Residue not found, skip

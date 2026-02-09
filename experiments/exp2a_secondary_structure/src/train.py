@@ -23,7 +23,6 @@ from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import WhitespaceSplit
 from transformers import (
-    DataCollatorForLanguageModeling,
     LlamaConfig,
     LlamaForCausalLM,
     PreTrainedTokenizerFast,
@@ -103,12 +102,18 @@ def create_model(vocab_size: int, **kwargs) -> LlamaForCausalLM:
 
 
 class TextDataset(torch.utils.data.Dataset):
-    """Wrapper dataset that returns tokenized text."""
+    """Wrapper dataset that returns tokenized text.
+
+    Masks the loss on everything before the <ss> marker so the model
+    only trains on predicting secondary structure labels, not coordinates.
+    """
 
     def __init__(self, dataset: SSDataset, tokenizer: PreTrainedTokenizer, max_length: int = 2048):
         self.dataset = dataset
         self.tokenizer = tokenizer
         self.max_length = max_length
+        # Get the token ID for <ss> marker
+        self.ss_token_id = tokenizer.convert_tokens_to_ids("<ss>")
 
     def __len__(self):
         return len(self.dataset)
@@ -134,9 +139,21 @@ class TextDataset(torch.utils.data.Dataset):
                 f"Text preview: {item['text'][:200]}"
             )
 
+        # Create labels: mask everything before and including <ss> with -100
+        # so loss is only computed on the SS prediction tokens
+        labels = list(input_ids)
+        ss_pos = None
+        for i, token_id in enumerate(input_ids):
+            if token_id == self.ss_token_id:
+                ss_pos = i
+        if ss_pos is not None:
+            for i in range(ss_pos + 1):
+                labels[i] = -100
+
         return {
             "input_ids": input_ids,
             "attention_mask": encoding["attention_mask"],
+            "labels": labels,
         }
 
 
@@ -367,6 +384,7 @@ class ExampleLoggingCallback(TrainerCallback):
             print(f"  Sequence: {ex['sequence']}")
             print(f"  True SS:  {ex['true_ss']}")
             print(f"  Pred SS:  {ex['pred_ss']}")
+            print(f"  Raw gen:  {ex['new_text']}")
             print(f"  Length: {ex['length']}, Pred length: {ex['pred_length']}")
 
         # Log to wandb
@@ -502,7 +520,7 @@ def train(
 
     # Limit training samples if specified
     if train_samples is not None and train_samples < len(train_dataset):
-        train_dataset.records = train_dataset.records[:train_samples]
+        train_dataset.offsets = train_dataset.offsets[:train_samples]
         print(f"  Limited train to: {len(train_dataset)} sequences")
 
     # Wrap with tokenization
@@ -536,11 +554,24 @@ def train(
         "vocab_size": len(tokenizer),
     }
 
-    # Data collator
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm=False,
-    )
+    # Data collator that pads and preserves our custom labels
+    pad_token_id = tokenizer.pad_token_id
+
+    def data_collator(features: list[dict]) -> dict:
+        max_len = max(len(f["input_ids"]) for f in features)
+        input_ids = []
+        attention_mask = []
+        labels = []
+        for f in features:
+            pad_len = max_len - len(f["input_ids"])
+            input_ids.append(f["input_ids"] + [pad_token_id] * pad_len)
+            attention_mask.append(f["attention_mask"] + [0] * pad_len)
+            labels.append(f["labels"] + [-100] * pad_len)
+        return {
+            "input_ids": torch.tensor(input_ids),
+            "attention_mask": torch.tensor(attention_mask),
+            "labels": torch.tensor(labels),
+        }
 
     # Training arguments
     training_args = TrainingArguments(

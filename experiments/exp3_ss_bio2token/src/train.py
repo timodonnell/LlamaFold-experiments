@@ -272,13 +272,13 @@ def evaluate_model(
         if length_matches:
             n_length_match += 1
 
-            # Compute Q3 accuracy
-            for true_label, pred_label in zip(true_ss, pred_ss):
-                class_total[true_label] += 1
-                total_residues += 1
-                if true_label == pred_label:
-                    correct_residues += 1
-                    class_correct[true_label] += 1
+        # Always count total residues; only credit correct if length matches
+        for i, true_label in enumerate(true_ss):
+            class_total[true_label] += 1
+            total_residues += 1
+            if length_matches and true_label == pred_ss[i]:
+                correct_residues += 1
+                class_correct[true_label] += 1
 
         # Log examples
         if idx < log_examples:

@@ -57,7 +57,7 @@ Each metric is logged under `gen_eval/{prefix_label}/{metric_name}`.
 |---------------------|-------------|
 | `pct_valid_atoms` | Across all generated documents, the percentage of atom token references that name a valid heavy atom for the residue's amino acid. Each contact has 2 atom references (one per residue), checked against the standard PDB heavy atom set for that amino acid (backbone N/CA/C/O/OXT + side-chain atoms). Positions are 1-indexed: `<p1>` refers to the first residue in the sequence. **Documents with invalid grammar contribute 0 valid atoms** and an estimated denominator of `2 × floor(n_generated_tokens / 4)`. |
 
-### Contact Recall
+### Contact Recall (exact)
 
 | Wandb key (suffix) | Description |
 |---------------------|-------------|
@@ -66,6 +66,16 @@ Each metric is logged under `gen_eval/{prefix_label}/{metric_name}`.
 | `contact_recall_top_100` | Same, but considering the first 100 ground-truth contacts per document. |
 
 A contact is considered "found" if the exact 4-tuple `(pos1, pos2, atom1, atom2)` appears anywhere in the model's output. For prefix prompts, the prefix contacts are included in the output set (since they are part of the full generated document), so recall for small cutoffs will naturally be higher with larger prefixes.
+
+### Position Recall (ignoring atoms)
+
+| Wandb key (suffix) | Description |
+|---------------------|-------------|
+| `position_recall_top_1` | Like `contact_recall_top_1`, but a ground-truth contact is considered "found" if **any** generated contact has the same residue pair `(pos1, pos2)`, regardless of which atoms are named. |
+| `position_recall_top_10` | Same, for the first 10 ground-truth contacts. |
+| `position_recall_top_100` | Same, for the first 100 ground-truth contacts. |
+
+This measures whether the model identifies the correct contacting residue pairs, even if it picks the wrong specific atoms. Position recall will always be ≥ contact recall.
 
 ### Example Wandb Keys
 
@@ -78,8 +88,11 @@ gen_eval/prefix_0/pct_valid_atoms
 gen_eval/prefix_0/contact_recall_top_1
 gen_eval/prefix_0/contact_recall_top_10
 gen_eval/prefix_0/contact_recall_top_100
+gen_eval/prefix_0/position_recall_top_1
+gen_eval/prefix_0/position_recall_top_10
+gen_eval/prefix_0/position_recall_top_100
 gen_eval/prefix_5/pct_valid_grammar
 gen_eval/prefix_5/pct_valid_grammar_and_order
 ...
-gen_eval/prefix_20/contact_recall_top_100
+gen_eval/prefix_20/position_recall_top_100
 ```

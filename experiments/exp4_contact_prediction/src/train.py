@@ -348,6 +348,8 @@ def evaluate_generation(
         total_atom_checks = 0
         recall_found: dict[int, int] = {k: 0 for k in recall_cutoffs}
         recall_total: dict[int, int] = {k: 0 for k in recall_cutoffs}
+        pos_recall_found: dict[int, int] = {k: 0 for k in recall_cutoffs}
+        pos_recall_total: dict[int, int] = {k: 0 for k in recall_cutoffs}
 
         for sequence, gt_contacts, base_prompt in parsed:
             # Build prompt with optional prefix contacts
@@ -415,11 +417,18 @@ def evaluate_generation(
             else:
                 all_output_contacts = set(gen_contacts)
 
+            # Position-only recall: match on (pos1, pos2) ignoring atoms
+            all_output_positions = {(c[0], c[1]) for c in all_output_contacts}
+
             for k in recall_cutoffs:
                 gt_subset = gt_contacts[:k]
                 found = sum(1 for c in gt_subset if c in all_output_contacts)
                 recall_found[k] += found
                 recall_total[k] += len(gt_subset)
+
+                pos_found = sum(1 for c in gt_subset if (c[0], c[1]) in all_output_positions)
+                pos_recall_found[k] += pos_found
+                pos_recall_total[k] += len(gt_subset)
 
         label = f"prefix_{n_prefix}"
         metrics: dict[str, float] = {
@@ -434,6 +443,9 @@ def evaluate_generation(
         for k in recall_cutoffs:
             metrics[f"contact_recall_top_{k}"] = (
                 100 * recall_found[k] / recall_total[k] if recall_total[k] else 0
+            )
+            metrics[f"position_recall_top_{k}"] = (
+                100 * pos_recall_found[k] / pos_recall_total[k] if pos_recall_total[k] else 0
             )
         results[label] = metrics
 

@@ -394,7 +394,7 @@ def train(
     dataset_name: str = "timodonnell/protein-docs",
     dataset_config: str = "default",
     train_split: str = "train",
-    val_split: str = "val",
+    val_split: str = "validation",
     max_token_length: int = 8192,
     train_samples: int | None = None,
     batch_size: int = 1,
@@ -601,7 +601,7 @@ def main():
     parser.add_argument("--dataset", type=str, default="timodonnell/protein-docs")
     parser.add_argument("--dataset-config", type=str, default="default")
     parser.add_argument("--train-split", type=str, default="train")
-    parser.add_argument("--val-split", type=str, default="val")
+    parser.add_argument("--val-split", type=str, default="validation")
     parser.add_argument("--max-token-length", type=int, default=8192)
     parser.add_argument("--train-samples", type=int, default=None, help="Limit training samples")
     parser.add_argument("--batch-size", type=int, default=1, help="Per-device batch size")

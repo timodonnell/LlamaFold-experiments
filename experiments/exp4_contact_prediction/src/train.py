@@ -408,14 +408,11 @@ def evaluate_generation(
                 total_valid_atoms += v
                 total_atom_checks += t
             else:
-                # Invalid grammar: estimate atom positions, all invalid
-                n_gen_before_end = len(gen_tokens)
-                for ei, et in enumerate(gen_tokens):
-                    if et in _END_MARKERS:
-                        n_gen_before_end = ei
-                        break
-                estimated_contacts = n_gen_before_end // 4
-                total_atom_checks += estimated_contacts * 2
+                # Invalid grammar: count all atoms as invalid.
+                # Use the number of ground-truth contacts as the denominator
+                # so that invalid documents always contribute meaningfully
+                # (avoids 0-denominator when model emits <end> immediately).
+                total_atom_checks += len(gt_contacts) * 2
 
             # (4) Contact recall — only on generated contacts, skip prefix
             # For prefix_N, evaluate on ground truth contacts N+1..N+K

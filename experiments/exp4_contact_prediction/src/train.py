@@ -827,6 +827,15 @@ def train(
 
     data_collator = DataCollator(pad_token_id=tokenizer.pad_token_id)
 
+    # Compute warmup_steps: explicit --warmup-steps takes priority, otherwise
+    # convert warmup_ratio to steps.  We never pass warmup_ratio to
+    # TrainingArguments because it is deprecated in transformers >=4.51.
+    if warmup_steps is None:
+        n_devices = max(int(os.environ.get("WORLD_SIZE", 1)), 1)
+        steps_per_epoch = math.ceil(len(train_dataset) / (batch_size * n_devices))
+        total_steps = steps_per_epoch * n_epochs
+        warmup_steps = int(total_steps * warmup_ratio)
+
     training_args = TrainingArguments(
         output_dir=str(output_path),
         num_train_epochs=n_epochs,
@@ -834,8 +843,7 @@ def train(
         per_device_eval_batch_size=batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=lr,
-        warmup_steps=warmup_steps if warmup_steps is not None else 0,
-        warmup_ratio=0.0 if warmup_steps is not None else warmup_ratio,
+        warmup_steps=warmup_steps,
         weight_decay=0.01,
         logging_steps=10,
         eval_strategy="steps",

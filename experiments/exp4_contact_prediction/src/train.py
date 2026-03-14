@@ -739,6 +739,7 @@ def train(
     lr: float = 2e-4,
     n_epochs: int = 3,
     warmup_ratio: float = 0.1,
+    warmup_steps: int | None = None,
     seed: int = 42,
     output_dir: str = "outputs/exp4",
     use_wandb: bool = True,
@@ -815,6 +816,7 @@ def train(
         "lr": lr,
         "n_epochs": n_epochs,
         "warmup_ratio": warmup_ratio,
+        "warmup_steps": warmup_steps,
         "seed": seed,
         "n_params": n_params,
         "hidden_size": model_config.hidden_size,
@@ -832,7 +834,8 @@ def train(
         per_device_eval_batch_size=batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=lr,
-        warmup_ratio=warmup_ratio,
+        warmup_steps=warmup_steps if warmup_steps is not None else 0,
+        warmup_ratio=0.0 if warmup_steps is not None else warmup_ratio,
         weight_decay=0.01,
         logging_steps=10,
         eval_strategy="steps",
@@ -920,6 +923,9 @@ def main():
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--n-epochs", type=int, default=3)
     parser.add_argument("--warmup-ratio", type=float, default=0.1)
+    parser.add_argument(
+        "--warmup-steps", type=int, default=None, help="Warmup steps (overrides --warmup-ratio)"
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default="outputs/exp4")
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
@@ -956,6 +962,7 @@ def main():
         lr=args.lr,
         n_epochs=args.n_epochs,
         warmup_ratio=args.warmup_ratio,
+        warmup_steps=args.warmup_steps,
         seed=args.seed,
         output_dir=args.output_dir,
         use_wandb=not args.no_wandb,

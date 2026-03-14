@@ -15,6 +15,8 @@ dependencies = [
     "scipy>=1.12",
     "biopython>=1.84",
     "biotite>=1.6.0",
+    "datasets>=2.18",
+    "matplotlib>=3.8",
 ]
 
 [project.optional-dependencies]

@@ -55,7 +55,7 @@ Each metric is logged under `gen_eval/{prefix_label}/{metric_name}`.
 
 | Wandb key (suffix) | Description |
 |---------------------|-------------|
-| `pct_valid_atoms` | Across all generated documents, the percentage of atom token references that name a valid heavy atom for the residue's amino acid. Each contact has 2 atom references (one per residue), checked against the standard PDB heavy atom set for that amino acid (backbone N/CA/C/O/OXT + side-chain atoms). Positions are 1-indexed: `<p1>` refers to the first residue in the sequence. **Documents with invalid grammar contribute 0 valid atoms** and an estimated denominator of `2 × floor(n_generated_tokens / 4)`. |
+| `pct_valid_atoms` | Across all generated documents, the percentage of atom token references that name a valid heavy atom for the residue's amino acid. Each contact has 2 atom references (one per residue), checked against the standard PDB heavy atom set for that amino acid (backbone N/CA/C/O/OXT + side-chain atoms). Positions are 1-indexed: `<p1>` refers to the first residue in the sequence. **Documents with invalid grammar contribute 0 valid atoms** and a denominator of `2 × n_ground_truth_contacts` (the number of atoms the model should have predicted), ensuring they always pull the metric down. |
 
 ### Contact Recall (exact)
 

@@ -16,6 +16,7 @@ Document format:
     <end>
 
 Each contact consists of 4 tokens: two position tokens and two atom tokens.
+Positions are 1-indexed (p1 = first residue in the sequence).
 """
 
 from __future__ import annotations
@@ -99,6 +100,33 @@ ATOM_NAMES = [
 # Maximum residue position index (generous upper bound)
 MAX_POSITION = 2000
 
+# Backbone atoms valid for all amino acids
+_BACKBONE = {"N", "CA", "C", "O", "OXT"}
+
+# Valid heavy atoms per amino acid (backbone + side chain)
+VALID_ATOMS: dict[str, set[str]] = {
+    "ALA": _BACKBONE | {"CB"},
+    "ARG": _BACKBONE | {"CB", "CG", "CD", "NE", "CZ", "NH1", "NH2"},
+    "ASN": _BACKBONE | {"CB", "CG", "OD1", "ND2"},
+    "ASP": _BACKBONE | {"CB", "CG", "OD1", "OD2"},
+    "CYS": _BACKBONE | {"CB", "SG"},
+    "GLN": _BACKBONE | {"CB", "CG", "CD", "OE1", "NE2"},
+    "GLU": _BACKBONE | {"CB", "CG", "CD", "OE1", "OE2"},
+    "GLY": _BACKBONE,
+    "HIS": _BACKBONE | {"CB", "CG", "ND1", "CD2", "CE1", "NE2"},
+    "ILE": _BACKBONE | {"CB", "CG1", "CG2", "CD1"},
+    "LEU": _BACKBONE | {"CB", "CG", "CD1", "CD2"},
+    "LYS": _BACKBONE | {"CB", "CG", "CD", "CE", "NZ"},
+    "MET": _BACKBONE | {"CB", "CG", "SD", "CE"},
+    "PHE": _BACKBONE | {"CB", "CG", "CD1", "CD2", "CE1", "CE2", "CZ"},
+    "PRO": _BACKBONE | {"CB", "CG", "CD"},
+    "SER": _BACKBONE | {"CB", "OG"},
+    "THR": _BACKBONE | {"CB", "OG1", "CG2"},
+    "TRP": _BACKBONE | {"CB", "CG", "CD1", "CD2", "NE1", "CE2", "CE3", "CZ2", "CZ3", "CH2"},
+    "TYR": _BACKBONE | {"CB", "CG", "CD1", "CD2", "CE1", "CE2", "CZ", "OH"},
+    "VAL": _BACKBONE | {"CB", "CG1", "CG2"},
+}
+
 
 def get_all_tokens() -> list[str]:
     """Return all domain-specific vocabulary tokens.
@@ -125,7 +153,7 @@ def load_hf_dataset(
     """Load protein docs dataset from HuggingFace.
 
     Args:
-        split: Dataset split name (e.g., "train", "val").
+        split: Dataset split name (e.g., "train", "validation").
         dataset_name: HuggingFace dataset identifier.
         config: Dataset configuration/subset name.
 

@@ -12,20 +12,23 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import matplotlib
-import numpy as np
-import torch
-import torch.nn.functional as functional
-import wandb
-from tokenizers import Tokenizer
-from tokenizers.models import WordLevel
-from tokenizers.pre_tokenizers import WhitespaceSplit
-from transformers import (
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
+import torch.nn.functional as functional  # noqa: E402
+from tokenizers import Tokenizer  # noqa: E402
+from tokenizers.models import WordLevel  # noqa: E402
+from tokenizers.pre_tokenizers import WhitespaceSplit  # noqa: E402
+from transformers import (  # noqa: E402
     LlamaConfig,
     LlamaForCausalLM,
     PreTrainedTokenizerFast,
@@ -34,13 +37,22 @@ from transformers import (
     TrainingArguments,
 )
 
-from .data import get_all_tokens, load_hf_dataset
+import wandb  # noqa: E402
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
+from .data import ATOM_NAMES, VALID_ATOMS, get_all_tokens, load_hf_dataset  # noqa: E402
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
+
+# Precomputed sets for fast lookup during parsing
+_ATOM_TOKEN_SET = {f"<{a}>" for a in ATOM_NAMES}
+_POS_PATTERN = re.compile(r"^<p(\d+)>$")
+_END_MARKERS = {"<end_contacts>", "<end>", "<eos>", "<pad>"}
+
+
+# ---------------------------------------------------------------------------
+# Tokenizer & model creation
+# ---------------------------------------------------------------------------
 
 
 def _is_main_process() -> bool:
@@ -90,12 +102,13 @@ def create_model(vocab_size: int, **kwargs) -> LlamaForCausalLM:
     return LlamaForCausalLM(config)
 
 
-class TextDataset(torch.utils.data.Dataset):
-    """Wraps a HuggingFace dataset, tokenizes documents for causal LM training.
+# ---------------------------------------------------------------------------
+# Dataset & collator
+# ---------------------------------------------------------------------------
 
-    Standard causal LM: labels = input_ids (the model shifts internally).
-    Padding positions get label -100 so they don't contribute to loss.
-    """
+
+class TextDataset(torch.utils.data.Dataset):
+    """Wraps a HuggingFace dataset, tokenizes documents for causal LM training."""
 
     def __init__(self, hf_dataset, tokenizer: PreTrainedTokenizer, max_length: int = 8192):
         self.hf_dataset = hf_dataset
@@ -116,7 +129,6 @@ class TextDataset(torch.utils.data.Dataset):
         )
         input_ids = encoding["input_ids"]
 
-        # Crash on unknown tokens (pad token id 0 is also the unk token)
         if 0 in input_ids:
             tokens = text.split()
             unk_tokens = [t for t in tokens if self.tokenizer.convert_tokens_to_ids(t) == 0]
@@ -155,6 +167,284 @@ class DataCollator:
         }
 
 
+# ---------------------------------------------------------------------------
+# Document parsing helpers
+# ---------------------------------------------------------------------------
+
+# A contact is (pos1, pos2, atom1, atom2) where positions are ints and atoms are strings.
+Contact = tuple[int, int, str, str]
+
+
+def parse_document(text: str) -> tuple[list[str], list[Contact], str]:
+    """Parse a protein document into sequence, contacts, and prompt.
+
+    Args:
+        text: Full document text.
+
+    Returns:
+        sequence: List of 3-letter amino acid codes (1-indexed: sequence[0] = residue at p1).
+        contacts: List of (pos1, pos2, atom1, atom2) tuples.
+        prompt: Text up to and including ``<begin_contacts>``.
+    """
+    tokens = text.split()
+
+    begin_seq_idx = tokens.index("<begin_sequence>")
+    begin_cont_idx = tokens.index("<begin_contacts>")
+
+    seq = [t.strip("<>") for t in tokens[begin_seq_idx + 1 : begin_cont_idx]]
+
+    # Find end of contacts
+    end_cont_idx = len(tokens)
+    for i in range(begin_cont_idx + 1, len(tokens)):
+        if tokens[i] in ("<end_contacts>", "<end>"):
+            end_cont_idx = i
+            break
+
+    contact_tokens = tokens[begin_cont_idx + 1 : end_cont_idx]
+    contacts, _ = parse_generated_contacts(contact_tokens)
+
+    prompt = " ".join(tokens[: begin_cont_idx + 1])
+    return seq, contacts, prompt
+
+
+def parse_generated_contacts(
+    tokens: list[str],
+) -> tuple[list[Contact], bool]:
+    """Parse a flat token list into contacts and validate grammar.
+
+    Grammar is valid if every token group is (position, position, atom, atom)
+    with no leftover or misplaced tokens before an end marker.
+
+    Args:
+        tokens: Token strings (after ``<begin_contacts>``).
+
+    Returns:
+        contacts: Parsed contacts (may be partial if grammar breaks).
+        is_valid_grammar: ``True`` if all groups matched the expected pattern.
+    """
+    contacts: list[Contact] = []
+    is_valid = True
+    i = 0
+
+    while i < len(tokens):
+        if tokens[i] in _END_MARKERS:
+            break
+
+        if i + 4 > len(tokens):
+            is_valid = False
+            break
+
+        t1, t2, t3, t4 = tokens[i : i + 4]
+
+        if any(t in _END_MARKERS for t in (t1, t2, t3, t4)):
+            if t1 in _END_MARKERS:
+                break
+            is_valid = False
+            break
+
+        m1 = _POS_PATTERN.match(t1)
+        m2 = _POS_PATTERN.match(t2)
+        if m1 and m2 and t3 in _ATOM_TOKEN_SET and t4 in _ATOM_TOKEN_SET:
+            contacts.append((int(m1.group(1)), int(m2.group(1)), t3.strip("<>"), t4.strip("<>")))
+            i += 4
+        else:
+            is_valid = False
+            break
+
+    return contacts, is_valid
+
+
+def check_contact_ordering(contacts: list[Contact]) -> bool:
+    """Check that contacts have non-increasing sequence separation."""
+    for i in range(1, len(contacts)):
+        prev_sep = abs(contacts[i - 1][0] - contacts[i - 1][1])
+        curr_sep = abs(contacts[i][0] - contacts[i][1])
+        if curr_sep > prev_sep:
+            return False
+    return True
+
+
+def check_atom_validity(
+    contacts: list[Contact],
+    sequence: list[str],
+) -> tuple[int, int]:
+    """Count how many atom references are valid for the residue's amino acid.
+
+    Positions are 1-indexed: position ``p`` maps to ``sequence[p - 1]``.
+
+    Returns:
+        (valid_count, total_count)
+    """
+    valid = 0
+    total = 0
+    for pos1, pos2, atom1, atom2 in contacts:
+        idx1 = pos1 - 1
+        idx2 = pos2 - 1
+
+        total += 1
+        if 0 <= idx1 < len(sequence):
+            aa = sequence[idx1]
+            if aa in VALID_ATOMS and atom1 in VALID_ATOMS[aa]:
+                valid += 1
+
+        total += 1
+        if 0 <= idx2 < len(sequence):
+            aa = sequence[idx2]
+            if aa in VALID_ATOMS and atom2 in VALID_ATOMS[aa]:
+                valid += 1
+
+    return valid, total
+
+
+# ---------------------------------------------------------------------------
+# Generation-based evaluation
+# ---------------------------------------------------------------------------
+
+
+def evaluate_generation(
+    model: torch.nn.Module,
+    tokenizer: PreTrainedTokenizer,
+    hf_dataset,
+    device: torch.device,
+    n_samples: int = 50,
+    max_new_tokens: int = 8000,
+    prefix_sizes: tuple[int, ...] = (0, 5, 10, 20),
+    recall_cutoffs: tuple[int, ...] = (1, 10, 100),
+) -> dict[str, dict[str, float]]:
+    """Evaluate model generation on contact prediction.
+
+    For each *prefix_size*, prompts the model with the sequence (and optionally
+    the first *prefix_size* ground-truth contacts) and generates up to
+    *max_new_tokens*.  Computes:
+
+    1. % valid high-level grammar (repeating pos-pos-atom-atom groups)
+    2. % valid grammar AND contacts in decreasing sequence-separation order
+    3. % of atom tokens that are valid for the residue's amino acid
+       (invalid-grammar documents contribute 0 valid / estimated total)
+    4. Contact recall at each cutoff (fraction of top-K ground-truth contacts
+       found anywhere in the output)
+
+    Returns:
+        Nested dict ``{prefix_label: {metric_name: value}}``.
+    """
+    model.eval()
+    end_token_id = tokenizer.convert_tokens_to_ids("<end>")
+
+    n_samples = min(n_samples, len(hf_dataset))
+    indices = np.random.choice(len(hf_dataset), size=n_samples, replace=False)
+
+    # Pre-parse all documents once
+    parsed: list[tuple[list[str], list[Contact], str]] = []
+    for idx in indices:
+        doc = hf_dataset[int(idx)]["document"]
+        parsed.append(parse_document(doc))
+
+    results: dict[str, dict[str, float]] = {}
+
+    for n_prefix in prefix_sizes:
+        n_valid_grammar = 0
+        n_valid_grammar_and_order = 0
+        total_valid_atoms = 0
+        total_atom_checks = 0
+        recall_found: dict[int, int] = {k: 0 for k in recall_cutoffs}
+        recall_total: dict[int, int] = {k: 0 for k in recall_cutoffs}
+
+        for sequence, gt_contacts, base_prompt in parsed:
+            # Build prompt with optional prefix contacts
+            if n_prefix > 0 and gt_contacts:
+                prefix = gt_contacts[:n_prefix]
+                prefix_tokens = []
+                for p1, p2, a1, a2 in prefix:
+                    prefix_tokens.extend([f"<p{p1}>", f"<p{p2}>", f"<{a1}>", f"<{a2}>"])
+                prompt = base_prompt + " " + " ".join(prefix_tokens)
+            else:
+                prompt = base_prompt
+
+            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=8192)
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+
+            try:
+                with torch.no_grad():
+                    outputs = model.generate(
+                        **inputs,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=False,
+                        pad_token_id=tokenizer.pad_token_id,
+                        eos_token_id=end_token_id,
+                    )
+            except Exception as e:
+                print(f"  Generation failed: {e}")
+                continue
+
+            # Decode only the generated tokens
+            gen_ids = outputs[0][inputs["input_ids"].shape[1] :]
+            gen_text = tokenizer.decode(gen_ids, skip_special_tokens=False)
+            gen_tokens = gen_text.split()
+
+            gen_contacts, valid_grammar = parse_generated_contacts(gen_tokens)
+
+            # (1) Grammar
+            if valid_grammar and len(gen_contacts) > 0:
+                n_valid_grammar += 1
+
+                # (2) Ordering — check full list (prefix + generated)
+                if n_prefix > 0 and gt_contacts:
+                    full_contacts = list(gt_contacts[:n_prefix]) + list(gen_contacts)
+                else:
+                    full_contacts = list(gen_contacts)
+                if check_contact_ordering(full_contacts):
+                    n_valid_grammar_and_order += 1
+
+                # (3) Atom validity — only generated contacts
+                v, t = check_atom_validity(gen_contacts, sequence)
+                total_valid_atoms += v
+                total_atom_checks += t
+            else:
+                # Invalid grammar: estimate atom positions, all invalid
+                n_gen_before_end = len(gen_tokens)
+                for ei, et in enumerate(gen_tokens):
+                    if et in _END_MARKERS:
+                        n_gen_before_end = ei
+                        break
+                estimated_contacts = n_gen_before_end // 4
+                total_atom_checks += estimated_contacts * 2
+
+            # (4) Contact recall — include prefix contacts in the output set
+            if n_prefix > 0 and gt_contacts:
+                all_output_contacts = set(gt_contacts[:n_prefix]) | set(gen_contacts)
+            else:
+                all_output_contacts = set(gen_contacts)
+
+            for k in recall_cutoffs:
+                gt_subset = gt_contacts[:k]
+                found = sum(1 for c in gt_subset if c in all_output_contacts)
+                recall_found[k] += found
+                recall_total[k] += len(gt_subset)
+
+        label = f"prefix_{n_prefix}"
+        metrics: dict[str, float] = {
+            "pct_valid_grammar": 100 * n_valid_grammar / n_samples if n_samples else 0,
+            "pct_valid_grammar_and_order": (
+                100 * n_valid_grammar_and_order / n_samples if n_samples else 0
+            ),
+            "pct_valid_atoms": (
+                100 * total_valid_atoms / total_atom_checks if total_atom_checks else 0
+            ),
+        }
+        for k in recall_cutoffs:
+            metrics[f"contact_recall_top_{k}"] = (
+                100 * recall_found[k] / recall_total[k] if recall_total[k] else 0
+            )
+        results[label] = metrics
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Per-contact-position perplexity
+# ---------------------------------------------------------------------------
+
+
 def compute_contact_position_perplexity(
     model: torch.nn.Module,
     tokenizer: PreTrainedTokenizer,
@@ -164,18 +454,6 @@ def compute_contact_position_perplexity(
     max_length: int = 8192,
 ) -> dict[int, tuple[float, int]]:
     """Compute average perplexity at each contact position across documents.
-
-    Each contact consists of 4 tokens (pos1, pos2, atom1, atom2). For each
-    contact position index (0 = first contact, 1 = second, ...), computes the
-    average cross-entropy over those 4 tokens and converts to perplexity.
-
-    Args:
-        model: The model in eval mode.
-        tokenizer: The tokenizer.
-        hf_dataset: HuggingFace dataset with "document" column.
-        device: Device to run on.
-        n_samples: Number of documents to sample.
-        max_length: Max token length for tokenization.
 
     Returns:
         Dict mapping contact position index to (perplexity, doc_count).
@@ -190,24 +468,17 @@ def compute_contact_position_perplexity(
     for i in range(n_samples):
         text = hf_dataset[i]["document"]
         encoding = tokenizer(
-            text,
-            truncation=True,
-            max_length=max_length,
-            padding=False,
-            return_tensors="pt",
+            text, truncation=True, max_length=max_length, padding=False, return_tensors="pt"
         )
         input_ids = encoding["input_ids"].to(device)
 
         with torch.no_grad():
-            outputs = model(input_ids=input_ids)
-            logits = outputs.logits  # (1, seq_len, vocab_size)
+            logits = model(input_ids=input_ids).logits
 
-        # Per-token cross-entropy: loss[i] predicts token i+1 from context 0..i
         shift_logits = logits[0, :-1]
         shift_labels = input_ids[0, 1:]
         per_token_loss = functional.cross_entropy(shift_logits, shift_labels, reduction="none")
 
-        # Find contact region boundaries
         ids = input_ids[0].tolist()
         begin_pos = None
         end_pos = None
@@ -220,35 +491,63 @@ def compute_contact_position_perplexity(
         if begin_pos is None:
             continue
         if end_pos is None:
-            end_pos = len(ids)  # Document was truncated, no end marker
+            end_pos = len(ids)
 
-        # Contact tokens start right after <begin_contacts>
         contact_start = begin_pos + 1
-        n_contact_tokens = end_pos - contact_start
-        n_contacts = n_contact_tokens // 4
+        n_contacts = (end_pos - contact_start) // 4
 
         for c in range(n_contacts):
-            # Loss indices for this contact's 4 tokens
-            # Token at position p has its prediction loss at per_token_loss[p-1]
             loss_start = contact_start + c * 4 - 1
             loss_end = loss_start + 4
             if loss_end > len(per_token_loss):
                 break
-            avg_loss = per_token_loss[loss_start:loss_end].mean().item()
-            position_losses[c].append(avg_loss)
+            position_losses[c].append(per_token_loss[loss_start:loss_end].mean().item())
 
-    # Convert to perplexity
     result: dict[int, tuple[float, int]] = {}
     for pos in sorted(position_losses.keys()):
         losses = position_losses[pos]
-        avg_loss = sum(losses) / len(losses)
-        result[pos] = (math.exp(avg_loss), len(losses))
-
+        result[pos] = (math.exp(sum(losses) / len(losses)), len(losses))
     return result
 
 
+# ---------------------------------------------------------------------------
+# Subsampled Trainer
+# ---------------------------------------------------------------------------
+
+
+class SubsampledTrainer(Trainer):
+    """Trainer that randomly subsamples the eval dataset at each evaluation step."""
+
+    def __init__(
+        self,
+        *args,
+        full_eval_dataset=None,
+        eval_subsample_size: int | None = None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self._full_eval_dataset = full_eval_dataset
+        self._eval_subsample_size = eval_subsample_size
+
+    def evaluate(self, eval_dataset=None, **kwargs):
+        if (
+            eval_dataset is None
+            and self._full_eval_dataset is not None
+            and self._eval_subsample_size is not None
+        ):
+            n = min(self._eval_subsample_size, len(self._full_eval_dataset))
+            indices = np.random.choice(len(self._full_eval_dataset), size=n, replace=False)
+            eval_dataset = torch.utils.data.Subset(self._full_eval_dataset, indices.tolist())
+        return super().evaluate(eval_dataset=eval_dataset, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Evaluation callback
+# ---------------------------------------------------------------------------
+
+
 class EvalCallback(TrainerCallback):
-    """Callback to generate example documents and compute contact perplexity."""
+    """Callback to generate examples, compute contact perplexity, and run generation eval."""
 
     def __init__(
         self,
@@ -256,17 +555,18 @@ class EvalCallback(TrainerCallback):
         tokenizer: PreTrainedTokenizer,
         use_wandb: bool = True,
         perplexity_samples: int = 200,
+        gen_eval_samples: int = 50,
         max_length: int = 8192,
     ):
         self.val_hf_dataset = val_hf_dataset
         self.tokenizer = tokenizer
         self.use_wandb = use_wandb
         self.perplexity_samples = perplexity_samples
+        self.gen_eval_samples = gen_eval_samples
         self.max_length = max_length
         self._running = False
 
     def on_evaluate(self, args, state, control, model, **kwargs):
-        """Run custom evaluation after each eval step."""
         if self._running:
             return
         self._running = True
@@ -285,7 +585,7 @@ class EvalCallback(TrainerCallback):
         # 1. Generate an example document
         example_doc = self._generate_example(raw_model, device)
 
-        # 2. Compute per-contact-position perplexity
+        # 2. Per-contact-position perplexity
         ppl_data = compute_contact_position_perplexity(
             model=raw_model,
             tokenizer=self.tokenizer,
@@ -295,17 +595,29 @@ class EvalCallback(TrainerCallback):
             max_length=self.max_length,
         )
 
-        # Print summary to terminal
+        # 3. Generation evaluation
+        gen_results = evaluate_generation(
+            model=raw_model,
+            tokenizer=self.tokenizer,
+            hf_dataset=self.val_hf_dataset,
+            device=device,
+            n_samples=self.gen_eval_samples,
+        )
+
+        # --- Terminal output ---
         print(f"\n[Step {state.global_step}] Contact Prediction Evaluation:")
         if ppl_data:
             positions = sorted(ppl_data.keys())
-            first_ppl = ppl_data[positions[0]][0]
-            last_ppl = ppl_data[positions[-1]][0]
             ppls = [ppl_data[p][0] for p in positions]
             print(f"  Contact positions tracked: {len(positions)}")
-            print(f"  First contact perplexity: {first_ppl:.2f}")
+            print(f"  First contact perplexity: {ppl_data[positions[0]][0]:.2f}")
             print(f"  Median contact perplexity: {float(np.median(ppls)):.2f}")
-            print(f"  Last contact perplexity: {last_ppl:.2f}")
+            print(f"  Last contact perplexity: {ppl_data[positions[-1]][0]:.2f}")
+
+        for label, metrics in gen_results.items():
+            print(f"\n  [{label}]")
+            for k, v in metrics.items():
+                print(f"    {k}: {v:.2f}%")
 
         if example_doc:
             print("\n  Generated document preview:")
@@ -313,58 +625,57 @@ class EvalCallback(TrainerCallback):
             if len(example_doc) > 500:
                 print(f"  ... ({len(example_doc)} chars total)")
 
-        # Log to wandb
+        # --- Wandb logging ---
         if not self.use_wandb or wandb.run is None:
             return
 
-        # Log example document as HTML for readability
+        step = state.global_step
+
         if example_doc:
             wandb.log(
                 {
                     "eval_examples/generated_document": wandb.Html(
                         f"<pre>{example_doc[:10000]}</pre>"
                     ),
-                    "global_step": state.global_step,
+                    "global_step": step,
                 }
             )
 
-        # Log per-contact-position perplexity
         if ppl_data:
             positions = sorted(ppl_data.keys())
             perplexities = [ppl_data[p][0] for p in positions]
             counts = [ppl_data[p][1] for p in positions]
 
-            # Create plot
             fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
             ax1.plot(positions, perplexities, linewidth=0.5)
             ax1.set_xlabel("Contact Position")
             ax1.set_ylabel("Perplexity")
-            ax1.set_title(f"Per-Contact-Position Perplexity (Step {state.global_step})")
-
+            ax1.set_title(f"Per-Contact-Position Perplexity (Step {step})")
             ax2.plot(positions, counts, linewidth=0.5, color="orange")
             ax2.set_xlabel("Contact Position")
             ax2.set_ylabel("# Documents")
             ax2.set_title("Documents Contributing per Position")
-
             plt.tight_layout()
-            wandb.log(
-                {
-                    "eval_examples/contact_perplexity_plot": wandb.Image(fig),
-                    "global_step": state.global_step,
-                }
-            )
+            wandb.log({
+                "eval_examples/contact_perplexity_plot": wandb.Image(fig),
+                "global_step": step,
+            })
             plt.close(fig)
 
-            # Log summary statistics
             wandb.log(
                 {
                     "eval_examples/first_contact_ppl": perplexities[0],
                     "eval_examples/median_contact_ppl": float(np.median(perplexities)),
                     "eval_examples/last_contact_ppl": perplexities[-1],
                     "eval_examples/n_contact_positions": len(positions),
-                    "global_step": state.global_step,
+                    "global_step": step,
                 }
             )
+
+        # Log generation eval metrics
+        for label, metrics in gen_results.items():
+            for metric_name, value in metrics.items():
+                wandb.log({f"gen_eval/{label}/{metric_name}": value, "global_step": step})
 
     def _generate_example(self, model: torch.nn.Module, device: torch.device) -> str | None:
         """Generate an example document from scratch."""
@@ -372,9 +683,7 @@ class EvalCallback(TrainerCallback):
         prompt = "<deterministic-positives-only>"
         inputs = self.tokenizer(prompt, return_tensors="pt")
         inputs = {k: v.to(device) for k, v in inputs.items()}
-
         end_token_id = self.tokenizer.convert_tokens_to_ids("<end>")
-
         try:
             with torch.no_grad():
                 outputs = model.generate(
@@ -390,6 +699,11 @@ class EvalCallback(TrainerCallback):
             return None
 
 
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+
+
 def train(
     dataset_name: str = "timodonnell/protein-docs",
     dataset_config: str = "default",
@@ -397,6 +711,8 @@ def train(
     val_split: str = "validation",
     max_token_length: int = 8192,
     train_samples: int | None = None,
+    eval_samples: int | None = None,
+    gen_eval_samples: int = 50,
     batch_size: int = 1,
     gradient_accumulation_steps: int = 1,
     lr: float = 2e-4,
@@ -413,34 +729,7 @@ def train(
     save_steps: int = 500,
     resume_from_checkpoint: str | bool | None = None,
 ) -> dict[str, Any]:
-    """Train the contact prediction LLM.
-
-    Args:
-        dataset_name: HuggingFace dataset name.
-        dataset_config: Dataset configuration/subset name.
-        train_split: Name of the training split.
-        val_split: Name of the validation split.
-        max_token_length: Maximum token sequence length.
-        train_samples: Limit training samples (None = all).
-        batch_size: Per-device training batch size.
-        gradient_accumulation_steps: Gradient accumulation steps.
-        lr: Learning rate.
-        n_epochs: Number of training epochs.
-        warmup_ratio: Warmup ratio.
-        seed: Random seed.
-        output_dir: Output directory.
-        use_wandb: Whether to use wandb logging.
-        wandb_project: Wandb project name.
-        wandb_entity: Wandb entity/team name.
-        wandb_run_name: Wandb run name.
-        perplexity_samples: Number of samples for contact perplexity computation.
-        eval_steps: Evaluate every N steps.
-        save_steps: Save checkpoint every N steps.
-        resume_from_checkpoint: Path to checkpoint or True for latest.
-
-    Returns:
-        Dictionary with training results.
-    """
+    """Train the contact prediction LLM."""
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -449,7 +738,6 @@ def train(
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    # Tokenizer and model
     if is_main:
         print("Setting up tokenizer and model...")
     tokenizer = create_tokenizer()
@@ -474,7 +762,6 @@ def train(
         print(f"  Max sequence length:  {model_config.max_position_embeddings}")
         print("=" * 60 + "\n")
 
-    # Load datasets
     if is_main:
         print("Loading datasets...")
     hf_train = load_hf_dataset(train_split, dataset_name, dataset_config)
@@ -484,17 +771,14 @@ def train(
         print(f"  Train: {len(hf_train)} documents")
         print(f"  Val:   {len(hf_val)} documents")
 
-    # Limit training samples if specified
     if train_samples is not None and train_samples < len(hf_train):
         hf_train = hf_train.select(range(train_samples))
         if is_main:
             print(f"  Limited train to: {len(hf_train)} documents")
 
-    # Wrap with tokenization
     train_dataset = TextDataset(hf_train, tokenizer, max_length=max_token_length)
     val_dataset = TextDataset(hf_val, tokenizer, max_length=max_token_length)
 
-    # Config for logging
     config = {
         "experiment": "exp4",
         "task": "contact_prediction",
@@ -502,6 +786,8 @@ def train(
         "dataset_config": dataset_config,
         "train_samples": len(hf_train),
         "val_samples": len(hf_val),
+        "eval_samples": eval_samples,
+        "gen_eval_samples": gen_eval_samples,
         "max_token_length": max_token_length,
         "batch_size": batch_size,
         "gradient_accumulation_steps": gradient_accumulation_steps,
@@ -543,46 +829,38 @@ def train(
         seed=seed,
     )
 
-    # Initialize wandb (main process only)
     if use_wandb and is_main:
-        wandb.init(
-            project=wandb_project,
-            entity=wandb_entity,
-            name=wandb_run_name,
-            config=config,
-        )
-        command = " ".join(sys.argv)
-        wandb.config.update({"command": command})
+        wandb.init(project=wandb_project, entity=wandb_entity, name=wandb_run_name, config=config)
+        wandb.config.update({"command": " ".join(sys.argv)})
 
-    # Create callback for example generation and contact perplexity
     eval_callback = EvalCallback(
         val_hf_dataset=hf_val,
         tokenizer=tokenizer,
         use_wandb=use_wandb,
         perplexity_samples=perplexity_samples,
+        gen_eval_samples=gen_eval_samples,
         max_length=max_token_length,
     )
 
-    trainer = Trainer(
+    trainer = SubsampledTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        eval_dataset=val_dataset,
+        eval_dataset=val_dataset,  # fallback for non-subsampled eval
         data_collator=data_collator,
         callbacks=[eval_callback],
+        full_eval_dataset=val_dataset if eval_samples else None,
+        eval_subsample_size=eval_samples,
     )
 
-    # Train
     if is_main:
         print("Starting training...")
     train_result = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
-    # Save model
     trainer.save_model(str(output_path / "final_model"))
     if is_main:
         tokenizer.save_pretrained(str(output_path / "final_model"))
 
-    # Save results
     results: dict[str, Any] = {"config": config, "train_loss": train_result.training_loss}
     if is_main:
         with open(output_path / "results.json", "w") as f:
@@ -604,6 +882,18 @@ def main():
     parser.add_argument("--val-split", type=str, default="validation")
     parser.add_argument("--max-token-length", type=int, default=8192)
     parser.add_argument("--train-samples", type=int, default=None, help="Limit training samples")
+    parser.add_argument(
+        "--eval-samples",
+        type=int,
+        default=None,
+        help="Subsample eval set to this many docs per eval step (random, different each step)",
+    )
+    parser.add_argument(
+        "--gen-eval-samples",
+        type=int,
+        default=50,
+        help="Number of docs for generation-based eval metrics",
+    )
     parser.add_argument("--batch-size", type=int, default=1, help="Per-device batch size")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--lr", type=float, default=2e-4)
@@ -615,12 +905,7 @@ def main():
     parser.add_argument("--wandb-project", type=str, default="exp4")
     parser.add_argument("--wandb-entity", type=str, default="timodonnell")
     parser.add_argument("--wandb-run-name", type=str, default=None)
-    parser.add_argument(
-        "--perplexity-samples",
-        type=int,
-        default=200,
-        help="Number of val samples for contact position perplexity",
-    )
+    parser.add_argument("--perplexity-samples", type=int, default=200)
     parser.add_argument("--eval-steps", type=int, default=500)
     parser.add_argument("--save-steps", type=int, default=500)
     parser.add_argument(
@@ -643,6 +928,8 @@ def main():
         val_split=args.val_split,
         max_token_length=args.max_token_length,
         train_samples=args.train_samples,
+        eval_samples=args.eval_samples,
+        gen_eval_samples=args.gen_eval_samples,
         batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         lr=args.lr,

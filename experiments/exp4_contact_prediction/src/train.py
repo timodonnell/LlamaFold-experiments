@@ -577,6 +577,7 @@ class EvalCallback(TrainerCallback):
         use_wandb: bool = True,
         perplexity_samples: int = 200,
         gen_eval_samples: int = 50,
+        gen_max_new_tokens: int = 8000,
         max_length: int = 8192,
     ):
         self.val_hf_dataset = val_hf_dataset
@@ -584,6 +585,7 @@ class EvalCallback(TrainerCallback):
         self.use_wandb = use_wandb
         self.perplexity_samples = perplexity_samples
         self.gen_eval_samples = gen_eval_samples
+        self.gen_max_new_tokens = gen_max_new_tokens
         self.max_length = max_length
         self._running = False
 
@@ -623,6 +625,7 @@ class EvalCallback(TrainerCallback):
             hf_dataset=self.val_hf_dataset,
             device=device,
             n_samples=self.gen_eval_samples,
+            max_new_tokens=self.gen_max_new_tokens,
         )
 
         # --- Terminal output ---
@@ -734,6 +737,7 @@ def train(
     train_samples: int | None = None,
     eval_samples: int | None = None,
     gen_eval_samples: int = 50,
+    gen_max_new_tokens: int = 8000,
     batch_size: int = 1,
     gradient_accumulation_steps: int = 1,
     lr: float = 2e-4,
@@ -810,6 +814,7 @@ def train(
         "val_samples": len(hf_val),
         "eval_samples": eval_samples,
         "gen_eval_samples": gen_eval_samples,
+        "gen_max_new_tokens": gen_max_new_tokens,
         "max_token_length": max_token_length,
         "batch_size": batch_size,
         "gradient_accumulation_steps": gradient_accumulation_steps,
@@ -871,6 +876,7 @@ def train(
         use_wandb=use_wandb,
         perplexity_samples=perplexity_samples,
         gen_eval_samples=gen_eval_samples,
+        gen_max_new_tokens=gen_max_new_tokens,
         max_length=max_token_length,
     )
 
@@ -926,6 +932,12 @@ def main():
         default=50,
         help="Number of docs for generation-based eval metrics",
     )
+    parser.add_argument(
+        "--gen-max-new-tokens",
+        type=int,
+        default=8000,
+        help="Max tokens to generate per doc during gen eval (default 8000)",
+    )
     parser.add_argument("--batch-size", type=int, default=1, help="Per-device batch size")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--lr", type=float, default=2e-4)
@@ -965,6 +977,7 @@ def main():
         train_samples=args.train_samples,
         eval_samples=args.eval_samples,
         gen_eval_samples=args.gen_eval_samples,
+        gen_max_new_tokens=args.gen_max_new_tokens,
         batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         lr=args.lr,

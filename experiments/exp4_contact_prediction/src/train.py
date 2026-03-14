@@ -341,6 +341,11 @@ def evaluate_generation(
 
     results: dict[str, dict[str, float]] = {}
 
+    from tqdm import tqdm
+
+    total_generations = len(parsed) * len(prefix_sizes)
+    pbar = tqdm(total=total_generations, desc="Gen eval", unit="gen")
+
     for n_prefix in prefix_sizes:
         n_valid_grammar = 0
         n_valid_grammar_and_order = 0
@@ -352,6 +357,7 @@ def evaluate_generation(
         pos_recall_total: dict[int, int] = {k: 0 for k in recall_cutoffs}
 
         for sequence, gt_contacts, base_prompt in parsed:
+            pbar.set_postfix_str(f"prefix={n_prefix}")
             # Build prompt with optional prefix contacts
             if n_prefix > 0 and gt_contacts:
                 prefix = gt_contacts[:n_prefix]
@@ -430,6 +436,8 @@ def evaluate_generation(
                 pos_recall_found[k] += pos_found
                 pos_recall_total[k] += len(gt_subset)
 
+            pbar.update(1)
+
         label = f"prefix_{n_prefix}"
         metrics: dict[str, float] = {
             "pct_valid_grammar": 100 * n_valid_grammar / n_samples if n_samples else 0,
@@ -449,6 +457,7 @@ def evaluate_generation(
             )
         results[label] = metrics
 
+    pbar.close()
     return results
 
 

@@ -417,22 +417,21 @@ def evaluate_generation(
                 estimated_contacts = n_gen_before_end // 4
                 total_atom_checks += estimated_contacts * 2
 
-            # (4) Contact recall — include prefix contacts in the output set
-            if n_prefix > 0 and gt_contacts:
-                all_output_contacts = set(gt_contacts[:n_prefix]) | set(gen_contacts)
-            else:
-                all_output_contacts = set(gen_contacts)
-
-            # Position-only recall: match on (pos1, pos2) ignoring atoms
-            all_output_positions = {(c[0], c[1]) for c in all_output_contacts}
+            # (4) Contact recall — only on generated contacts, skip prefix
+            # For prefix_N, evaluate on ground truth contacts N+1..N+K
+            # (the prefix contacts are given, so matching them is trivial)
+            gen_contact_set = set(gen_contacts)
+            gen_position_set = {(c[0], c[1]) for c in gen_contacts}
 
             for k in recall_cutoffs:
-                gt_subset = gt_contacts[:k]
-                found = sum(1 for c in gt_subset if c in all_output_contacts)
+                gt_subset = gt_contacts[n_prefix : n_prefix + k]
+                found = sum(1 for c in gt_subset if c in gen_contact_set)
                 recall_found[k] += found
                 recall_total[k] += len(gt_subset)
 
-                pos_found = sum(1 for c in gt_subset if (c[0], c[1]) in all_output_positions)
+                pos_found = sum(
+                    1 for c in gt_subset if (c[0], c[1]) in gen_position_set
+                )
                 pos_recall_found[k] += pos_found
                 pos_recall_total[k] += len(gt_subset)
 
@@ -702,10 +701,13 @@ class EvalCallback(TrainerCallback):
                 wandb.log({f"gen_eval/{label}/{metric_name}": value, "global_step": step})
 
     def _generate_example(self, model: torch.nn.Module, device: torch.device) -> str | None:
-        """Generate an example document from scratch."""
+        """Generate contacts for a random validation protein sequence."""
         model.eval()
-        prompt = "<deterministic-positives-only>"
-        inputs = self.tokenizer(prompt, return_tensors="pt")
+        idx = np.random.randint(len(self.val_hf_dataset))
+        doc = self.val_hf_dataset[int(idx)]["document"]
+        _, _, prompt = parse_document(doc)
+
+        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=8192)
         inputs = {k: v.to(device) for k, v in inputs.items()}
         end_token_id = self.tokenizer.convert_tokens_to_ids("<end>")
         try:

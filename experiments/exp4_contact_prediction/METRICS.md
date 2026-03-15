@@ -77,6 +77,17 @@ A contact is considered "found" if the exact 4-tuple `(pos1, pos2, atom1, atom2)
 
 This measures whether the model identifies the correct contacting residue pairs, even if it picks the wrong specific atoms. Position recall will always be ≥ contact recall.
 
+### Atom Name Diversity
+
+Computed separately for the first atom (atom1) and second atom (atom2) in each contact, across all generated contacts from documents with valid grammar.
+
+| Wandb key (suffix) | Description |
+|---------------------|-------------|
+| `atom1_n_unique` | Number of distinct atom names used in the first atom slot across all generated contacts. If the model always outputs `<N>`, this would be 1. A well-trained model should use many of the 37 possible atom names. |
+| `atom2_n_unique` | Same for the second atom slot. |
+| `atom1_entropy` | Shannon entropy (nats) of the atom1 name distribution. Higher = more diverse. Max possible is ln(37) ≈ 3.61. A model that always outputs the same atom has entropy 0. |
+| `atom2_entropy` | Same for the second atom slot. |
+
 ### Example Wandb Keys
 
 Full metric keys follow the pattern `gen_eval/{prefix}/{metric}`:
@@ -91,6 +102,10 @@ gen_eval/prefix_0/contact_recall_top_100
 gen_eval/prefix_0/position_recall_top_1
 gen_eval/prefix_0/position_recall_top_10
 gen_eval/prefix_0/position_recall_top_100
+gen_eval/prefix_0/atom1_n_unique
+gen_eval/prefix_0/atom1_entropy
+gen_eval/prefix_0/atom2_n_unique
+gen_eval/prefix_0/atom2_entropy
 gen_eval/prefix_5/pct_valid_grammar
 gen_eval/prefix_5/pct_valid_grammar_and_order
 ...

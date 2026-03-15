@@ -41,6 +41,10 @@ import wandb  # noqa: E402
 
 from .data import ATOM_NAMES, VALID_ATOMS, get_all_tokens, load_hf_dataset  # noqa: E402
 
+# Index lookup for atom diversity tracking
+_ATOM_NAME_TO_IDX = {name: i for i, name in enumerate(ATOM_NAMES)}
+_N_ATOM_NAMES = len(ATOM_NAMES)
+
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
 
@@ -380,6 +384,8 @@ def evaluate_generation(
 
     for n_prefix in prefix_sizes:
         accum = torch.zeros(n_accum, dtype=torch.float64, device=device)
+        atom1_counts = torch.zeros(_N_ATOM_NAMES, dtype=torch.float64, device=device)
+        atom2_counts = torch.zeros(_N_ATOM_NAMES, dtype=torch.float64, device=device)
 
         for sequence, gt_contacts, base_prompt in my_parsed:
             if pbar is not None:
@@ -432,6 +438,15 @@ def evaluate_generation(
                 v, t = check_atom_validity(gen_contacts, sequence)
                 accum[2] += v  # total_valid_atoms
                 accum[3] += t  # total_atom_checks
+
+                # Track atom name diversity
+                for _, _, a1, a2 in gen_contacts:
+                    idx1 = _ATOM_NAME_TO_IDX.get(a1)
+                    idx2 = _ATOM_NAME_TO_IDX.get(a2)
+                    if idx1 is not None:
+                        atom1_counts[idx1] += 1
+                    if idx2 is not None:
+                        atom2_counts[idx2] += 1
             else:
                 accum[3] += len(gt_contacts) * 2  # total_atom_checks (all invalid)
 
@@ -453,6 +468,8 @@ def evaluate_generation(
         # Sum counts across all ranks
         if world_size > 1:
             dist.all_reduce(accum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(atom1_counts, op=dist.ReduceOp.SUM)
+            dist.all_reduce(atom2_counts, op=dist.ReduceOp.SUM)
 
         # Unpack into metrics
         a = accum.cpu().tolist()
@@ -468,6 +485,17 @@ def evaluate_generation(
             metrics[f"position_recall_top_{k}"] = (
                 100 * a[base + 2] / a[base + 3] if a[base + 3] else 0
             )
+
+        # Atom name diversity: n_unique and entropy for atom1 and atom2
+        for slot_name, counts in [("atom1", atom1_counts.cpu()), ("atom2", atom2_counts.cpu())]:
+            nonzero = counts[counts > 0]
+            metrics[f"{slot_name}_n_unique"] = float(len(nonzero))
+            if len(nonzero) > 0:
+                probs = nonzero / nonzero.sum()
+                metrics[f"{slot_name}_entropy"] = float(-(probs * probs.log()).sum().item())
+            else:
+                metrics[f"{slot_name}_entropy"] = 0.0
+
         results[label] = metrics
 
     if pbar is not None:

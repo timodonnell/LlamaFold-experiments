@@ -640,10 +640,8 @@ class EvalCallback(TrainerCallback):
                 print(f"    {k}: {v:.2f}%")
 
         if example_doc:
-            print("\n  Generated document preview:")
-            print(f"  {example_doc[:500]}")
-            if len(example_doc) > 500:
-                print(f"  ... ({len(example_doc)} chars total)")
+            print("\n  Generated document:")
+            print(example_doc)
 
         # --- Wandb logging ---
         if not self.use_wandb or wandb.run is None:

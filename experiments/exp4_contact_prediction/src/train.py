@@ -409,6 +409,8 @@ def evaluate_generation(
             except Exception as e:
                 if is_main:
                     print(f"  Generation failed: {e}")
+                # Count as invalid: 0 valid atoms, gt_contacts * 2 total
+                accum[3] += len(gt_contacts) * 2
                 if pbar is not None:
                     pbar.update(1)
                 continue
@@ -587,8 +589,23 @@ class SubsampledTrainer(Trainer):
             and self._eval_subsample_size is not None
         ):
             n = min(self._eval_subsample_size, len(self._full_eval_dataset))
-            indices = np.random.choice(len(self._full_eval_dataset), size=n, replace=False)
-            eval_dataset = torch.utils.data.Subset(self._full_eval_dataset, indices.tolist())
+            rank, world_size = _get_dist_info()
+            # Synchronize random indices across DDP ranks so all ranks
+            # evaluate on the same subset (DistributedSampler shards it).
+            if world_size > 1:
+                idx_tensor = torch.zeros(n, dtype=torch.long, device=self.args.device)
+                if rank == 0:
+                    idx_tensor[:] = torch.tensor(
+                        np.random.choice(len(self._full_eval_dataset), size=n, replace=False),
+                        dtype=torch.long,
+                    )
+                dist.broadcast(idx_tensor, src=0)
+                indices = idx_tensor.cpu().tolist()
+            else:
+                indices = np.random.choice(
+                    len(self._full_eval_dataset), size=n, replace=False
+                ).tolist()
+            eval_dataset = torch.utils.data.Subset(self._full_eval_dataset, indices)
         return super().evaluate(eval_dataset=eval_dataset, **kwargs)
 
 

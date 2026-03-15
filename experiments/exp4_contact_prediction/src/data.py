@@ -97,8 +97,8 @@ ATOM_NAMES = [
     "OXT",
 ]
 
-# Maximum residue position index (generous upper bound)
-MAX_POSITION = 2000
+# Maximum residue position index (generous upper bound; max observed seq_len ~2041)
+MAX_POSITION = 2700
 
 # Backbone atoms valid for all amino acids
 _BACKBONE = {"N", "CA", "C", "O", "OXT"}

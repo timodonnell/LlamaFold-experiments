@@ -753,6 +753,7 @@ def train(
     eval_steps: int = 500,
     save_steps: int = 500,
     resume_from_checkpoint: str | bool | None = None,
+    load_weights_only: str | None = None,
 ) -> dict[str, Any]:
     """Train the contact prediction LLM."""
     output_path = Path(output_dir)
@@ -767,6 +768,15 @@ def train(
         print("Setting up tokenizer and model...")
     tokenizer = create_tokenizer()
     model = create_model(vocab_size=len(tokenizer))
+
+    # Load model weights from a checkpoint without restoring optimizer/scheduler
+    if load_weights_only:
+        ckpt_path = Path(load_weights_only)
+        if is_main:
+            print(f"Loading model weights from {ckpt_path} (optimizer/scheduler reset)...")
+        state_dict = LlamaForCausalLM.from_pretrained(str(ckpt_path)).state_dict()
+        model.load_state_dict(state_dict)
+        del state_dict
 
     n_params = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -960,6 +970,12 @@ def main():
         default=None,
         help="Path to checkpoint directory, or 'latest' to resume from latest",
     )
+    parser.add_argument(
+        "--load-weights-only",
+        type=str,
+        default=None,
+        help="Load model weights from checkpoint without restoring optimizer/scheduler",
+    )
 
     args = parser.parse_args()
 
@@ -993,6 +1009,7 @@ def main():
         eval_steps=args.eval_steps,
         save_steps=args.save_steps,
         resume_from_checkpoint=resume,
+        load_weights_only=args.load_weights_only,
     )
 
 

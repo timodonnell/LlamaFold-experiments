@@ -14,7 +14,6 @@ import math
 import os
 import re
 import sys
-from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -24,6 +23,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
+import torch.distributed as dist  # noqa: E402
 import torch.nn.functional as functional  # noqa: E402
 from tokenizers import Tokenizer  # noqa: E402
 from tokenizers.models import WordLevel  # noqa: E402
@@ -59,6 +59,13 @@ def _is_main_process() -> bool:
     """Check if this is the main process in distributed training."""
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
     return local_rank in (-1, 0)
+
+
+def _get_dist_info() -> tuple[int, int]:
+    """Return (rank, world_size). Falls back to (0, 1) for single-GPU."""
+    if dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size()
+    return 0, 1
 
 
 def create_tokenizer() -> PreTrainedTokenizerFast:
@@ -313,58 +320,77 @@ def evaluate_generation(
 ) -> dict[str, dict[str, float]]:
     """Evaluate model generation on contact prediction.
 
-    For each *prefix_size*, prompts the model with the sequence (and optionally
-    the first *prefix_size* ground-truth contacts) and generates up to
-    *max_new_tokens*.  Computes:
-
-    1. % valid high-level grammar (repeating pos-pos-atom-atom groups)
-    2. % valid grammar AND contacts in decreasing sequence-separation order
-    3. % of atom tokens that are valid for the residue's amino acid
-       (invalid-grammar documents contribute 0 valid / estimated total)
-    4. Contact recall at each cutoff (fraction of top-K ground-truth contacts
-       found anywhere in the output)
+    Parallelized across GPUs when running under DDP: rank 0 picks sample
+    indices, broadcasts them, each rank generates for its slice, then
+    counts are all-reduced back.
 
     Returns:
         Nested dict ``{prefix_label: {metric_name: value}}``.
     """
-    model.eval()
-    end_token_id = tokenizer.convert_tokens_to_ids("<end>")
-
-    n_samples = min(n_samples, len(hf_dataset))
-    indices = np.random.choice(len(hf_dataset), size=n_samples, replace=False)
-
-    # Pre-parse all documents once
-    parsed: list[tuple[list[str], list[Contact], str]] = []
-    for idx in indices:
-        doc = hf_dataset[int(idx)]["document"]
-        parsed.append(parse_document(doc))
-
-    results: dict[str, dict[str, float]] = {}
-
     from tqdm import tqdm
 
-    total_generations = len(parsed) * len(prefix_sizes)
-    pbar = tqdm(total=total_generations, desc="Gen eval", unit="gen")
+    model.eval()
+    end_token_id = tokenizer.convert_tokens_to_ids("<end>")
+    rank, world_size = _get_dist_info()
+    is_main = rank == 0
+
+    n_samples = min(n_samples, len(hf_dataset))
+
+    # Rank 0 picks random indices, broadcasts to all ranks
+    if world_size > 1:
+        indices_tensor = torch.zeros(n_samples, dtype=torch.long, device=device)
+        if is_main:
+            indices_tensor[:] = torch.tensor(
+                np.random.choice(len(hf_dataset), size=n_samples, replace=False),
+                dtype=torch.long,
+            )
+        dist.broadcast(indices_tensor, src=0)
+        indices = indices_tensor.cpu().tolist()
+    else:
+        indices = np.random.choice(len(hf_dataset), size=n_samples, replace=False).tolist()
+
+    # All ranks parse all documents (fast, CPU only)
+    parsed: list[tuple[list[str], list[Contact], str]] = []
+    for idx in indices:
+        parsed.append(parse_document(hf_dataset[idx]["document"]))
+
+    # Each rank takes its interleaved slice
+    my_parsed = parsed[rank::world_size]
+
+    # Accumulator layout per prefix:
+    #   [0] n_valid_grammar
+    #   [1] n_valid_grammar_and_order
+    #   [2] total_valid_atoms
+    #   [3] total_atom_checks
+    #   For each cutoff i:
+    #     [4 + i*4 + 0] recall_found
+    #     [4 + i*4 + 1] recall_total
+    #     [4 + i*4 + 2] pos_recall_found
+    #     [4 + i*4 + 3] pos_recall_total
+    n_accum = 4 + 4 * len(recall_cutoffs)
+
+    results: dict[str, dict[str, float]] = {}
+    pbar = None
+    if is_main:
+        pbar = tqdm(
+            total=len(my_parsed) * len(prefix_sizes),
+            desc=f"Gen eval (×{world_size} GPUs)" if world_size > 1 else "Gen eval",
+            unit="gen",
+        )
 
     for n_prefix in prefix_sizes:
-        n_valid_grammar = 0
-        n_valid_grammar_and_order = 0
-        total_valid_atoms = 0
-        total_atom_checks = 0
-        recall_found: dict[int, int] = {k: 0 for k in recall_cutoffs}
-        recall_total: dict[int, int] = {k: 0 for k in recall_cutoffs}
-        pos_recall_found: dict[int, int] = {k: 0 for k in recall_cutoffs}
-        pos_recall_total: dict[int, int] = {k: 0 for k in recall_cutoffs}
+        accum = torch.zeros(n_accum, dtype=torch.float64, device=device)
 
-        for sequence, gt_contacts, base_prompt in parsed:
-            pbar.set_postfix_str(f"prefix={n_prefix}")
-            # Build prompt with optional prefix contacts
+        for sequence, gt_contacts, base_prompt in my_parsed:
+            if pbar is not None:
+                pbar.set_postfix_str(f"prefix={n_prefix}")
+
+            # Build prompt
             if n_prefix > 0 and gt_contacts:
-                prefix = gt_contacts[:n_prefix]
-                prefix_tokens = []
-                for p1, p2, a1, a2 in prefix:
-                    prefix_tokens.extend([f"<p{p1}>", f"<p{p2}>", f"<{a1}>", f"<{a2}>"])
-                prompt = base_prompt + " " + " ".join(prefix_tokens)
+                prefix_toks = []
+                for p1, p2, a1, a2 in gt_contacts[:n_prefix]:
+                    prefix_toks.extend([f"<p{p1}>", f"<p{p2}>", f"<{a1}>", f"<{a2}>"])
+                prompt = base_prompt + " " + " ".join(prefix_toks)
             else:
                 prompt = base_prompt
 
@@ -381,85 +407,78 @@ def evaluate_generation(
                         eos_token_id=end_token_id,
                     )
             except Exception as e:
-                print(f"  Generation failed: {e}")
+                if is_main:
+                    print(f"  Generation failed: {e}")
+                if pbar is not None:
+                    pbar.update(1)
                 continue
 
-            # Decode only the generated tokens
             gen_ids = outputs[0][inputs["input_ids"].shape[1] :]
             gen_text = tokenizer.decode(gen_ids, skip_special_tokens=False)
-            gen_tokens = gen_text.split()
+            gen_contacts, valid_grammar = parse_generated_contacts(gen_text.split())
 
-            gen_contacts, valid_grammar = parse_generated_contacts(gen_tokens)
-
-            # (1) Grammar
             if valid_grammar and len(gen_contacts) > 0:
-                n_valid_grammar += 1
+                accum[0] += 1  # n_valid_grammar
 
-                # (2) Ordering — check full list (prefix + generated)
                 if n_prefix > 0 and gt_contacts:
                     full_contacts = list(gt_contacts[:n_prefix]) + list(gen_contacts)
                 else:
                     full_contacts = list(gen_contacts)
                 if check_contact_ordering(full_contacts):
-                    n_valid_grammar_and_order += 1
+                    accum[1] += 1  # n_valid_grammar_and_order
 
-                # (3) Atom validity — only generated contacts
                 v, t = check_atom_validity(gen_contacts, sequence)
-                total_valid_atoms += v
-                total_atom_checks += t
+                accum[2] += v  # total_valid_atoms
+                accum[3] += t  # total_atom_checks
             else:
-                # Invalid grammar: count all atoms as invalid.
-                # Use the number of ground-truth contacts as the denominator
-                # so that invalid documents always contribute meaningfully
-                # (avoids 0-denominator when model emits <end> immediately).
-                total_atom_checks += len(gt_contacts) * 2
+                accum[3] += len(gt_contacts) * 2  # total_atom_checks (all invalid)
 
-            # (4) Contact recall — only on generated contacts, skip prefix
-            # For prefix_N, evaluate on ground truth contacts N+1..N+K
-            # (the prefix contacts are given, so matching them is trivial)
             gen_contact_set = set(gen_contacts)
             gen_position_set = {(c[0], c[1]) for c in gen_contacts}
-
-            for k in recall_cutoffs:
+            for ci, k in enumerate(recall_cutoffs):
                 gt_subset = gt_contacts[n_prefix : n_prefix + k]
-                found = sum(1 for c in gt_subset if c in gen_contact_set)
-                recall_found[k] += found
-                recall_total[k] += len(gt_subset)
-
-                pos_found = sum(
+                base = 4 + ci * 4
+                accum[base] += sum(1 for c in gt_subset if c in gen_contact_set)
+                accum[base + 1] += len(gt_subset)
+                accum[base + 2] += sum(
                     1 for c in gt_subset if (c[0], c[1]) in gen_position_set
                 )
-                pos_recall_found[k] += pos_found
-                pos_recall_total[k] += len(gt_subset)
+                accum[base + 3] += len(gt_subset)
 
-            pbar.update(1)
+            if pbar is not None:
+                pbar.update(1)
 
+        # Sum counts across all ranks
+        if world_size > 1:
+            dist.all_reduce(accum, op=dist.ReduceOp.SUM)
+
+        # Unpack into metrics
+        a = accum.cpu().tolist()
         label = f"prefix_{n_prefix}"
         metrics: dict[str, float] = {
-            "pct_valid_grammar": 100 * n_valid_grammar / n_samples if n_samples else 0,
-            "pct_valid_grammar_and_order": (
-                100 * n_valid_grammar_and_order / n_samples if n_samples else 0
-            ),
-            "pct_valid_atoms": (
-                100 * total_valid_atoms / total_atom_checks if total_atom_checks else 0
-            ),
+            "pct_valid_grammar": 100 * a[0] / n_samples if n_samples else 0,
+            "pct_valid_grammar_and_order": 100 * a[1] / n_samples if n_samples else 0,
+            "pct_valid_atoms": 100 * a[2] / a[3] if a[3] else 0,
         }
-        for k in recall_cutoffs:
-            metrics[f"contact_recall_top_{k}"] = (
-                100 * recall_found[k] / recall_total[k] if recall_total[k] else 0
-            )
+        for ci, k in enumerate(recall_cutoffs):
+            base = 4 + ci * 4
+            metrics[f"contact_recall_top_{k}"] = 100 * a[base] / a[base + 1] if a[base + 1] else 0
             metrics[f"position_recall_top_{k}"] = (
-                100 * pos_recall_found[k] / pos_recall_total[k] if pos_recall_total[k] else 0
+                100 * a[base + 2] / a[base + 3] if a[base + 3] else 0
             )
         results[label] = metrics
 
-    pbar.close()
+    if pbar is not None:
+        pbar.close()
     return results
 
 
 # ---------------------------------------------------------------------------
 # Per-contact-position perplexity
 # ---------------------------------------------------------------------------
+
+
+_PPL_MAX_POSITIONS = 3000  # more contact positions than any document will have
 
 
 def compute_contact_position_perplexity(
@@ -472,17 +491,25 @@ def compute_contact_position_perplexity(
 ) -> dict[int, tuple[float, int]]:
     """Compute average perplexity at each contact position across documents.
 
+    Parallelized across GPUs when running under DDP: each rank processes
+    its slice, then loss sums and counts are all-reduced.
+
     Returns:
         Dict mapping contact position index to (perplexity, doc_count).
     """
     model.eval()
     begin_contacts_id = tokenizer.convert_tokens_to_ids("<begin_contacts>")
     end_contacts_id = tokenizer.convert_tokens_to_ids("<end_contacts>")
+    rank, world_size = _get_dist_info()
 
-    position_losses: dict[int, list[float]] = defaultdict(list)
     n_samples = min(n_samples, len(hf_dataset))
+    all_indices = list(range(n_samples))
+    my_indices = all_indices[rank::world_size]
 
-    for i in range(n_samples):
+    loss_sum = torch.zeros(_PPL_MAX_POSITIONS, dtype=torch.float64, device=device)
+    loss_count = torch.zeros(_PPL_MAX_POSITIONS, dtype=torch.float64, device=device)
+
+    for i in my_indices:
         text = hf_dataset[i]["document"]
         encoding = tokenizer(
             text, truncation=True, max_length=max_length, padding=False, return_tensors="pt"
@@ -513,17 +540,24 @@ def compute_contact_position_perplexity(
         contact_start = begin_pos + 1
         n_contacts = (end_pos - contact_start) // 4
 
-        for c in range(n_contacts):
+        for c in range(min(n_contacts, _PPL_MAX_POSITIONS)):
             loss_start = contact_start + c * 4 - 1
             loss_end = loss_start + 4
             if loss_end > len(per_token_loss):
                 break
-            position_losses[c].append(per_token_loss[loss_start:loss_end].mean().item())
+            loss_sum[c] += per_token_loss[loss_start:loss_end].mean().item()
+            loss_count[c] += 1
+
+    # Sum across ranks
+    if world_size > 1:
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(loss_count, op=dist.ReduceOp.SUM)
 
     result: dict[int, tuple[float, int]] = {}
-    for pos in sorted(position_losses.keys()):
-        losses = position_losses[pos]
-        result[pos] = (math.exp(sum(losses) / len(losses)), len(losses))
+    for pos in range(_PPL_MAX_POSITIONS):
+        count = int(loss_count[pos].item())
+        if count > 0:
+            result[pos] = (math.exp(loss_sum[pos].item() / count), count)
     return result
 
 
@@ -595,16 +629,19 @@ class EvalCallback(TrainerCallback):
             self._running = False
 
     def _do_evaluate(self, args, state, control, model, **kwargs):
-        if not _is_main_process():
-            return
+        # All ranks participate in distributed eval (generation + perplexity).
+        # Only rank 0 does example generation, printing, and wandb logging.
+        is_main = _is_main_process()
 
         raw_model = model.module if hasattr(model, "module") else model
         device = next(raw_model.parameters()).device
 
-        # 1. Generate an example document
-        example_doc = self._generate_example(raw_model, device)
+        # 1. Generate an example document (rank 0 only)
+        example_doc = None
+        if is_main:
+            example_doc = self._generate_example(raw_model, device)
 
-        # 2. Per-contact-position perplexity
+        # 2. Per-contact-position perplexity (all ranks)
         ppl_data = compute_contact_position_perplexity(
             model=raw_model,
             tokenizer=self.tokenizer,
@@ -614,7 +651,7 @@ class EvalCallback(TrainerCallback):
             max_length=self.max_length,
         )
 
-        # 3. Generation evaluation
+        # 3. Generation evaluation (all ranks)
         gen_results = evaluate_generation(
             model=raw_model,
             tokenizer=self.tokenizer,
@@ -624,7 +661,10 @@ class EvalCallback(TrainerCallback):
             max_new_tokens=self.gen_max_new_tokens,
         )
 
-        # --- Terminal output ---
+        if not is_main:
+            return
+
+        # --- Terminal output (rank 0 only) ---
         print(f"\n[Step {state.global_step}] Contact Prediction Evaluation:")
         if ppl_data:
             positions = sorted(ppl_data.keys())

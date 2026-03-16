@@ -161,3 +161,41 @@ def load_hf_dataset(
         HuggingFace Dataset object with a "document" column.
     """
     return _hf_load_dataset(dataset_name, config, split=split)
+
+
+def filter_by_cluster_limit(dataset, max_docs_per_cluster: int, seed: int = 42):
+    """Limit the number of documents per struct_cluster_id.
+
+    Randomly selects up to *max_docs_per_cluster* documents from each
+    cluster, ensuring no cluster is over-represented during training.
+
+    Args:
+        dataset: HuggingFace Dataset with a ``struct_cluster_id`` column.
+        max_docs_per_cluster: Maximum documents to keep per cluster.
+        seed: Random seed for reproducible subsampling.
+
+    Returns:
+        Filtered HuggingFace Dataset.
+    """
+    from collections import defaultdict
+
+    import numpy as np
+
+    rng = np.random.RandomState(seed)
+
+    # Group indices by cluster
+    cluster_to_indices: dict[str, list[int]] = defaultdict(list)
+    cluster_ids = dataset["struct_cluster_id"]
+    for i, cid in enumerate(cluster_ids):
+        cluster_to_indices[cid].append(i)
+
+    # Subsample each cluster
+    keep_indices: list[int] = []
+    for indices in cluster_to_indices.values():
+        if len(indices) <= max_docs_per_cluster:
+            keep_indices.extend(indices)
+        else:
+            keep_indices.extend(rng.choice(indices, size=max_docs_per_cluster, replace=False).tolist())
+
+    keep_indices.sort()
+    return dataset.select(keep_indices)

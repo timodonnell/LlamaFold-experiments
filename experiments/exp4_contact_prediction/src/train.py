@@ -39,7 +39,7 @@ from transformers import (  # noqa: E402
 
 import wandb  # noqa: E402
 
-from .data import ATOM_NAMES, VALID_ATOMS, get_all_tokens, load_hf_dataset  # noqa: E402
+from .data import ATOM_NAMES, VALID_ATOMS, filter_by_cluster_limit, get_all_tokens, load_hf_dataset  # noqa: E402
 
 # Index lookup for atom diversity tracking
 _ATOM_NAME_TO_IDX = {name: i for i, name in enumerate(ATOM_NAMES)}
@@ -837,6 +837,7 @@ def train(
     save_steps: int = 500,
     resume_from_checkpoint: str | bool | None = None,
     load_weights_only: str | None = None,
+    max_docs_per_cluster: int | None = None,
 ) -> dict[str, Any]:
     """Train the contact prediction LLM."""
     output_path = Path(output_dir)
@@ -885,6 +886,13 @@ def train(
     hf_train = load_hf_dataset(train_split, dataset_name, dataset_config)
     hf_val = load_hf_dataset(val_split, dataset_name, dataset_config)
 
+    if max_docs_per_cluster is not None:
+        if is_main:
+            print(f"  Filtering to max {max_docs_per_cluster} docs per struct_cluster_id...")
+        hf_train = filter_by_cluster_limit(hf_train, max_docs_per_cluster, seed=seed)
+        if is_main:
+            print(f"  Train after cluster limit: {len(hf_train)} documents")
+
     if is_main:
         print(f"  Train: {len(hf_train)} documents")
         print(f"  Val:   {len(hf_val)} documents")
@@ -902,6 +910,7 @@ def train(
         "task": "contact_prediction",
         "dataset_name": dataset_name,
         "dataset_config": dataset_config,
+        "max_docs_per_cluster": max_docs_per_cluster,
         "train_samples": len(hf_train),
         "val_samples": len(hf_val),
         "eval_samples": eval_samples,
@@ -1059,6 +1068,12 @@ def main():
         default=None,
         help="Load model weights from checkpoint without restoring optimizer/scheduler",
     )
+    parser.add_argument(
+        "--max-docs-per-cluster",
+        type=int,
+        default=None,
+        help="Limit training docs per struct_cluster_id (prevents overfitting to large clusters)",
+    )
 
     args = parser.parse_args()
 
@@ -1093,6 +1108,7 @@ def main():
         save_steps=args.save_steps,
         resume_from_checkpoint=resume,
         load_weights_only=args.load_weights_only,
+        max_docs_per_cluster=args.max_docs_per_cluster,
     )
 
 

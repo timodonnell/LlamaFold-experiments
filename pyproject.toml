@@ -17,6 +17,7 @@ dependencies = [
     "biotite>=1.6.0",
     "datasets>=2.18",
     "matplotlib>=3.8",
+    "ipykernel>=7.2.0",
 ]
 
 [project.optional-dependencies]

@@ -709,40 +709,43 @@ class EvalCallback(TrainerCallback):
         is_main = _is_main_process()
 
         raw_model = model.module if hasattr(model, "module") else model
-        device = next(raw_model.parameters()).device
 
-        # For FSDP: summon full parameters so generate() and forward() work
+        # FSDP: generate() and independent forward passes deadlock under
+        # summon_full_params because internal hooks still trigger collectives.
+        # Skip generation eval and per-position perplexity under FSDP; the
+        # Trainer's built-in eval_loss still works correctly.
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-        fsdp_model = None
-        if isinstance(model, FSDP):
-            fsdp_model = model
-        elif isinstance(raw_model, FSDP):
-            fsdp_model = raw_model
-        ctx = FSDP.summon_full_params(fsdp_model) if fsdp_model is not None else nullcontext()
-
-        with ctx:
-            example_doc = None
+        is_fsdp = isinstance(model, FSDP) or isinstance(raw_model, FSDP)
+        if is_fsdp:
             if is_main:
-                example_doc = self._generate_example(raw_model, device)
+                print(f"\n[Step {state.global_step}] Skipping generation eval under FSDP "
+                      "(eval_loss is still computed by the Trainer)")
+            return
 
-            ppl_data = compute_contact_position_perplexity(
-                model=raw_model,
-                tokenizer=self.tokenizer,
-                hf_dataset=self.val_hf_dataset,
-                device=device,
-                n_samples=self.perplexity_samples,
-                max_length=self.max_length,
-            )
+        device = next(raw_model.parameters()).device
 
-            gen_results = evaluate_generation(
-                model=raw_model,
-                tokenizer=self.tokenizer,
-                hf_dataset=self.val_hf_dataset,
-                device=device,
-                n_samples=self.gen_eval_samples,
-                max_new_tokens=self.gen_max_new_tokens,
-            )
+        example_doc = None
+        if is_main:
+            example_doc = self._generate_example(raw_model, device)
+
+        ppl_data = compute_contact_position_perplexity(
+            model=raw_model,
+            tokenizer=self.tokenizer,
+            hf_dataset=self.val_hf_dataset,
+            device=device,
+            n_samples=self.perplexity_samples,
+            max_length=self.max_length,
+        )
+
+        gen_results = evaluate_generation(
+            model=raw_model,
+            tokenizer=self.tokenizer,
+            hf_dataset=self.val_hf_dataset,
+            device=device,
+            n_samples=self.gen_eval_samples,
+            max_new_tokens=self.gen_max_new_tokens,
+        )
 
         if not is_main:
             return

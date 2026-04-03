@@ -151,8 +151,9 @@ def run_esmfold_benchmark(
                     positions, seq_len, CONTACT_CUTOFF
                 )
 
-            # Get pLDDT
-            plddt = outputs.plddt[0, :seq_len].mean().item()
+            # Get pLDDT (ESMFold returns 0-1, convert to 0-100)
+            plddt_raw = outputs.plddt[0, :seq_len].mean().item()
+            plddt = plddt_raw * 100 if plddt_raw <= 1.0 else plddt_raw
 
             result = {
                 "entry_id": entry_id,
